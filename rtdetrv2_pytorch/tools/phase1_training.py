@@ -50,6 +50,7 @@ class Phase1Trainer:
         clip_max_norm: float = 0.1,
         training_strategy: str = 'joint',
         alternate_interval: int = 1,
+        same_frame: bool = False,
     ):
         self.model = model
         self.criterion = criterion
@@ -65,6 +66,7 @@ class Phase1Trainer:
         self.clip_max_norm = clip_max_norm
         self.training_strategy = training_strategy
         self.alternate_interval = alternate_interval
+        self.same_frame = same_frame
         
         print(f"\nTraining Strategy: {training_strategy}")
         if training_strategy == 'alternate':
@@ -90,6 +92,8 @@ class Phase1Trainer:
                     param.requires_grad = True
     
         elif training_strategy == 'joint':
+            for param in self.model.encoder.parameters():
+                param.requires_grad = False
             print(f"  Training both key and non-key paths jointly")
         else:
             raise ValueError(f"Invalid strategy: {training_strategy}")
@@ -137,6 +141,13 @@ class Phase1Trainer:
         
         for batch_idx, batch in enumerate(self.dataloader):
             img_key, target_key, img_non_key, target_non_key = batch
+
+            if self.same_frame:
+                img_non_key = img_key.clone()
+                # Safely clone the target dictionaries
+                target_non_key = [{k: v.clone() if isinstance(v, torch.Tensor) else v 
+                                  for k, v in t.items()} for t in target_key]
+                
             img_key = img_key.to(self.device)
             img_non_key = img_non_key.to(self.device)
             target_key = [{k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
@@ -152,8 +163,26 @@ class Phase1Trainer:
             
             if train_key:
                 outputs_key = self.model.forward_key_frame(img_key, target_key)
-                loss_dict_key = self.criterion(outputs_key, target_key)
-                loss_key = sum(loss_dict_key.values())
+                loss_dict_key, key_indices = self.criterion(
+                    outputs_key, target_key, return_indices=True
+                )
+
+                # Remove all aux loss
+                final_loss_dict = {}
+                for k, v in loss_dict_key.items():
+                    # 1. Drop Multi-layer / Aux losses (keys ending in a number like _0, _1, _2)
+                    if k[-1].isdigit():
+                        continue
+                        
+                    # 2. Drop Denoising (DN) losses (keys containing 'dn')
+                    if 'dn' in k:
+                        continue
+                        
+                    # 3. Keep ONLY the final layer's main outputs
+                    # (Usually 'loss_vfl', 'loss_bbox', 'loss_giou')
+                    final_loss_dict[k] = v
+    
+                loss_key = sum(final_loss_dict.values())
                 loss = loss_key
                 loss_key_value = loss_key.item()
 
@@ -163,7 +192,7 @@ class Phase1Trainer:
                         self.model.forward_key_frame(img_key, target_key)
                 
                 outputs_non_key = self.model.forward_non_key_frame(img_non_key, target_non_key)
-                loss_dict_non_key = self.criterion(outputs_non_key, target_non_key)
+                loss_dict_non_key = self.criterion(outputs_non_key, target_non_key, cached_indices=key_indices)
                 loss_non_key = sum(loss_dict_non_key.values())
                 loss_non_key_value = loss_non_key.item()
                 
@@ -306,16 +335,18 @@ class Phase1Trainer:
         coco_eval.evaluate()
         coco_eval.accumulate()
         coco_eval.summarize()
-
-        del coco_dt
-        del coco_eval
-        gc.collect()
-        
-        return {
+      
+        stats =  {
             'mAP': coco_eval.stats[0],
             'mAP@50': coco_eval.stats[1],
             'mAP@75': coco_eval.stats[2]
         }
+
+        del coco_dt
+        del coco_eval
+        gc.collect()
+
+        return stats
     
     def save_checkpoint(self, epoch: int, metrics: Dict[str, float]):
         """Save model checkpoint"""
@@ -454,6 +485,9 @@ def main():
     parser.add_argument('--output_dir', type=str, default=None, 
                        help='Output directory (overrides config)')
     
+    parser.add_argument('--same_frame', action='store_true',
+                       help='Diagnostic: Force non-key frame to be identical to key frame')
+    
     args = parser.parse_args()
     
     if not os.path.exists(args.config):
@@ -564,6 +598,7 @@ def main():
         clip_max_norm=clip_max_norm,
         training_strategy=args.training_strategy,
         alternate_interval=args.alternate_interval,
+        same_frame=args.same_frame
     )
     
     # Training loop

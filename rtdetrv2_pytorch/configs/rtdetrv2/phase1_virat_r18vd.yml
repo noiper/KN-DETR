@@ -32,7 +32,7 @@ RTDETRTransformer:
   num_classes: ${num_classes}
 
 # Phase 1 Temporal Training Specific Parameters
-lambda_non_key: 0.5      # Loss weight for non-key frames: L = L_key + λ*L_non_key
+lambda_non_key: 1.5      # Loss weight for non-key frames: L = L_key + λ*L_non_key
 
 # Non-key frame decoder configuration
 use_lightweight_decoder: True  # True: 1-layer decoder, False: 3-layer decoder (full)

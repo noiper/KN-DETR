@@ -23,9 +23,11 @@ class TemporalFusionBlock(nn.Module):
         
         # Fusion layer (combines projected S with CCFF)
         self.fusion = nn.Sequential(
-            nn.Conv2d(hidden_dim * 2, hidden_dim, kernel_size=3, padding=1, bias=False),
+            # kernel_size=3, padding=2, dilation=2
+            nn.Conv2d(hidden_dim * 2, hidden_dim, kernel_size=3, padding=2, dilation=2, bias=False),
             nn.BatchNorm2d(hidden_dim),
             nn.ReLU(inplace=True),
+            # 1x1 conv remains the same
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1, bias=False),
             nn.BatchNorm2d(hidden_dim)
         )
@@ -183,7 +185,7 @@ class TemporalRTDETR(nn.Module):
         if use_lightweight_decoder:
             self.lightweight_decoder = LightweightDecoder(
                 full_decoder=decoder,
-                num_layers=1
+                num_layers=3
             )
         else:
             self.lightweight_decoder = None

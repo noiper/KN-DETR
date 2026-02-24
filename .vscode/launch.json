@@ -8,6 +8,7 @@
             "program": "${workspaceFolder}/rtdetrv2_pytorch/tools/phase1_training.py",
             "console": "integratedTerminal",
             "justMyCode": false,
+            "python": "/home/robin/miniconda3/envs/rtdetr/bin/python",
             "args": [
                 "-c",
                 "rtdetrv2_pytorch/configs/rtdetrv2/phase1_virat_r18vd.yml",
@@ -30,6 +31,7 @@
             "program": "${workspaceFolder}/rtdetrv2_pytorch/tools/test_best_pth_simple.py",
             "console": "integratedTerminal",
             "justMyCode": false,
+            "python": "/home/robin/miniconda3/envs/rtdetr/bin/python",
             "args": [
                 "-c",
                 "rtdetrv2_pytorch/configs/rtdetrv2/phase1_virat_r18vd.yml",
@@ -47,6 +49,7 @@
             "program": "${workspaceFolder}/rtdetrv2_pytorch/tools/train.py",
             "console": "integratedTerminal",
             "justMyCode": false,
+            "python": "/home/robin/miniconda3/envs/rtdetr/bin/python",
             "args": [
                 "-c",
                 "rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r18vd_virat.yml",
