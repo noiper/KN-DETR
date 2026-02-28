@@ -266,6 +266,10 @@ class Phase1Trainer:
         results_non_key = []
         
         for batch_idx, (img_key, target_key, img_non_key, target_non_key) in enumerate(val_dataloader):
+            if self.same_frame:
+                img_non_key = img_key.clone()
+                target_non_key = target_key
+
             img_key = img_key.to(self.device)
             # --- KEY FRAME ---
             outputs_key = self.model.forward_key_frame(img_key, None)
@@ -370,7 +374,7 @@ class Phase1Trainer:
         if not best_path.exists():
             torch.save(checkpoint, best_path)
         else:
-            best_checkpoint = torch.load(best_path)
+            best_checkpoint = torch.load(best_path, weights_only=False)
             if metrics['loss'] < best_checkpoint['metrics']['loss']:
                 torch.save(checkpoint, best_path)
                 print(f"✓ New best model saved!")
@@ -428,7 +432,7 @@ def load_pretrained_key_frame(model: TemporalRTDETR, pretrained_path: str, devic
     """
     print(f"\nLoading pretrained key frame path from: {pretrained_path}")
     
-    checkpoint = torch.load(pretrained_path, map_location=device)
+    checkpoint = torch.load(pretrained_path, map_location=device, weights_only=False)
     state_dict = checkpoint['model']
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     
@@ -469,6 +473,8 @@ def main():
                        help='Alternate strategy only: switch every N epochs')
     parser.add_argument('--pretrained', type=str, default=None,
                        help='Path to pretrained key frame model')
+    parser.add_argument('--pretrained_temporal', type=str, default=None,
+                       help='Path to full temporal model from a previous curriculum round')
     
     # Debug mode
     parser.add_argument('--debug', action='store_true')
@@ -488,6 +494,9 @@ def main():
     parser.add_argument('--same_frame', action='store_true',
                        help='Diagnostic: Force non-key frame to be identical to key frame')
     
+    parser.add_argument('--init_weights', action='store_true', 
+                       help='Warm start: Copy pretrained key decoder weights to non-key decoder')
+    
     args = parser.parse_args()
     
     if not os.path.exists(args.config):
@@ -504,6 +513,17 @@ def main():
 
         if args.pretrained:
             load_pretrained_key_frame(model, args.pretrained, device)
+            print(f"Loaded pretrained weights from {args.pretrained}")
+
+        if args.init_weights:
+            model.lightweight_decoder.load_state_dict(model.decoder.state_dict(), strict=False)
+            print("Non-key decoder initialization complete.")
+
+        if args.pretrained_temporal:
+            checkpoint = torch.load(args.pretrained_temporal, map_location=device, weights_only=False)
+            state_dict = checkpoint.get('model_state_dict', checkpoint.get('model', checkpoint))
+            model.load_state_dict(state_dict)
+            print("Successfully loaded full temporal weights!")
         
         # Get config values (with overrides)
         epochs = args.epochs if args.epochs is not None else getattr(cfg, 'epoches', 50)
@@ -568,7 +588,7 @@ def main():
     if args.resume:
         print(f"\nResuming from: {args.resume}")
         try:
-            checkpoint = torch.load(args.resume, map_location=device)
+            checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             start_epoch = checkpoint['epoch'] + 1

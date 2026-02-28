@@ -7,8 +7,8 @@ __include__: [
 ]
 
 # Override output directory
-output_dir: './output/phase1_virat_r18vd'
-summary_dir: './output/phase1_virat_r18vd/summary'
+output_dir: './output/phase1_virat_r18vd_v2'
+summary_dir: './output/phase1_virat_r18vd_v2/summary'
 
 # Override to ResNet18
 PResNet:
@@ -32,7 +32,7 @@ RTDETRTransformer:
   num_classes: ${num_classes}
 
 # Phase 1 Temporal Training Specific Parameters
-lambda_non_key: 1.5      # Loss weight for non-key frames: L = L_key + λ*L_non_key
+lambda_non_key: 0.5      # Loss weight for non-key frames: L = L_key + λ*L_non_key
 
 # Non-key frame decoder configuration
 use_lightweight_decoder: True  # True: 1-layer decoder, False: 3-layer decoder (full)
@@ -40,13 +40,13 @@ reuse_queries: True            # True: reuse queries from key frame (experimenta
 non_key_decoder_layers: 1       # Number of layers for non-key decoder (1 or 3)
 
 # Training Settings
-epoches: 50
+epoches: 20
 clip_max_norm: 0.1
 
 # Learning Rate Scheduler (override)
 lr_scheduler:
   type: MultiStepLR
-  milestones: [30, 40]
+  milestones: [15, 18]
   gamma: 0.1
 
 # Logging and Checkpointing

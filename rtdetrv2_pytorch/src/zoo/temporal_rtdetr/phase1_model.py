@@ -31,6 +31,11 @@ class TemporalFusionBlock(nn.Module):
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1, bias=False),
             nn.BatchNorm2d(hidden_dim)
         )
+
+        # Initialize the final Conv2d and BatchNorm to output exactly 0.0
+        nn.init.constant_(self.fusion[3].weight, 0.0)
+        nn.init.constant_(self.fusion[4].weight, 0.0)
+        nn.init.constant_(self.fusion[4].bias, 0.0)
         
     def forward(self, s_feat: torch.Tensor, ccff_feat: torch.Tensor) -> torch.Tensor:
         """
@@ -71,16 +76,23 @@ class LightweightDecoder(RTDETRTransformerv2):
 
         # Copy decoder layers
         self.num_decoder_layers = min(num_layers, full_decoder.decoder.num_layers)
-        self.decoder = TransformerDecoder(full_decoder.hidden_dim, full_decoder.decoder.layers[0], self.num_decoder_layers)
-        
-        self.input_proj = copy.deepcopy(full_decoder.input_proj)
-        self.query_pos_head = copy.deepcopy(full_decoder.query_pos_head)
-        self.dec_score_head = nn.ModuleList([
-            copy.deepcopy(full_decoder.dec_score_head[i]) for i in range(num_layers)
-        ])
-        self.dec_bbox_head = nn.ModuleList([
-            copy.deepcopy(full_decoder.dec_bbox_head[i]) for i in range(num_layers)
-        ])
+        self.decoder = TransformerDecoder(
+            full_decoder.hidden_dim, 
+            copy.deepcopy(full_decoder.decoder.layers[-1]), 
+            self.num_decoder_layers
+        )
+
+        # Share by direct memory reference.
+        self.input_proj = full_decoder.input_proj
+        self.query_pos_head = full_decoder.query_pos_head
+
+        # Slice the ModuleList to grab only the LAST `num_layers` heads
+        self.dec_score_head = nn.ModuleList(
+            list(full_decoder.dec_score_head[-self.num_decoder_layers:])
+        )
+        self.dec_bbox_head = nn.ModuleList(
+            list(full_decoder.dec_bbox_head[-self.num_decoder_layers:])
+        )
         
         self.eval_spatial_size = full_decoder.eval_spatial_size
     
@@ -185,7 +197,7 @@ class TemporalRTDETR(nn.Module):
         if use_lightweight_decoder:
             self.lightweight_decoder = LightweightDecoder(
                 full_decoder=decoder,
-                num_layers=3
+                num_layers=1
             )
         else:
             self.lightweight_decoder = None

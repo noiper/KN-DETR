@@ -48,7 +48,7 @@ val_dataloader:
     type: ViratTemporalDataset
     root_dir: ../dataset/VIRAT/val_videos/
     ann_file: ../dataset/VIRAT/val.json
-    max_frame_gap: 10
+    max_frame_gap: 1
     pair_sampling_strategy: "fixed_gap"
     frame_stride: 1
     transforms:
