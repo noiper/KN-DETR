@@ -7,8 +7,8 @@ __include__: [
 ]
 
 # Override output directory
-output_dir: './output/phase1_virat_r18vd_v2'
-summary_dir: './output/phase1_virat_r18vd_v2/summary'
+output_dir: './output/phase1_virat_r18vd_v2_noncurriculum'
+summary_dir: './output/phase1_virat_r18vd_v2_noncurriculum/summary'
 
 # Override to ResNet18
 PResNet:

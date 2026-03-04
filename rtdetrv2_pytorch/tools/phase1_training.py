@@ -90,6 +90,16 @@ class Phase1Trainer:
             if hasattr(self.model, 'lightweight_decoder') and self.model.lightweight_decoder is not None:
                 for param in self.model.lightweight_decoder.parameters():
                     param.requires_grad = True
+            
+            # Re-freeze the shared prediction heads.
+            for param in self.model.lightweight_decoder.dec_score_head.parameters():
+                param.requires_grad = False
+            for param in self.model.lightweight_decoder.dec_bbox_head.parameters():
+                param.requires_grad = False
+            for param in self.model.lightweight_decoder.input_proj.parameters():
+                param.requires_grad = False
+            for param in self.model.lightweight_decoder.query_pos_head.parameters():
+                param.requires_grad = False
     
         elif training_strategy == 'joint':
             for param in self.model.encoder.parameters():
@@ -189,11 +199,41 @@ class Phase1Trainer:
             if train_non_key:
                 if not train_key:
                     with torch.no_grad():
-                        self.model.forward_key_frame(img_key, target_key)
+                        outputs_key = self.model.forward_key_frame(img_key, target_key)
+                        _, key_indices = self.criterion(
+                            outputs_key, target_key, return_indices=True
+                        )
+
+                # 1. THE TEACHER: Run non-key image through frozen heavy encoder
+                with torch.no_grad():
+                    teacher_backbone_feats = self.model.backbone(img_non_key)
+                    teacher_c3, teacher_c4, teacher_c5 = teacher_backbone_feats[-3:]
+                    teacher_ccff = self.model.encoder([teacher_c3, teacher_c4, teacher_c5])
                 
-                outputs_non_key = self.model.forward_non_key_frame(img_non_key, target_non_key)
+                # 2. THE STUDENT: Get standard outputs AND the fused student features
+                outputs_non_key, student_fused = self.model.forward_non_key_frame(
+                    img_non_key, target_non_key, return_fused=True
+                )
+                
+                # 3. Calculate standard bounding box loss
                 loss_dict_non_key = self.criterion(outputs_non_key, target_non_key, cached_indices=key_indices)
-                loss_non_key = sum(loss_dict_non_key.values())
+                loss_non_key_bbox = sum(loss_dict_non_key.values())
+                
+                # 4. Calculate KD Loss (MSE between student and teacher)
+                loss_kd = 0.0
+                for s_feat, t_feat in zip(student_fused, teacher_ccff):
+                    loss_kd += torch.nn.functional.smooth_l1_loss(s_feat, t_feat)
+                
+                # 5. Combine Losses
+                # (KD weight balances the tiny MSE values against the larger L1/GIoU bbox losses)
+                # Decay KD weight over time to allow more focus on bbox loss as training progresses
+                base_kd_weight = 5.0
+                current_kd_weight = base_kd_weight * (0.5 ** epoch)
+                loss_non_key = loss_non_key_bbox + (current_kd_weight * loss_kd)
+                
+                # outputs_non_key = self.model.forward_non_key_frame(img_non_key, target_non_key)
+                # loss_dict_non_key = self.criterion(outputs_non_key, target_non_key, cached_indices=key_indices)
+                # loss_non_key = sum(loss_dict_non_key.values())
                 loss_non_key_value = loss_non_key.item()
                 
                 if loss is None:

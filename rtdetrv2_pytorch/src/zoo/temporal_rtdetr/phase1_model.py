@@ -232,7 +232,7 @@ class TemporalRTDETR(nn.Module):
         
         return outputs
     
-    def forward_non_key_frame(self, img: torch.Tensor, targets: Optional[List[Dict]] = None) -> Dict:
+    def forward_non_key_frame(self, img: torch.Tensor, targets: Optional[List[Dict]] = None, return_fused: bool = False) -> Dict:
         """
         Forward non-key frame through lightweight pipeline with fusion
         
@@ -273,7 +273,9 @@ class TemporalRTDETR(nn.Module):
         else:
             # Use full decoder
             outputs = self.decoder(decoder_input, targets=targets)
-        
+
+        if return_fused:
+            return outputs, fused_features
         return outputs
     
     def forward(self, key_frame: torch.Tensor, non_key_frame: torch.Tensor, 
