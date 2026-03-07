@@ -13,7 +13,7 @@
                 "-c",
                 "rtdetrv2_pytorch/configs/rtdetrv2/phase1_virat_r18vd.yml",
                 "--debug",
-                "--pretrained",
+                "--weights",
                 "best.pth",
                 "--training_strategy",
                 "joint"

@@ -7,8 +7,8 @@ __include__: [
 ]
 
 # Override output directory
-output_dir: './output/phase1_virat_r18vd_v2_noncurriculum'
-summary_dir: './output/phase1_virat_r18vd_v2_noncurriculum/summary'
+output_dir: './output/test'
+summary_dir: './output/test/summary'
 
 # Override to ResNet18
 PResNet:
@@ -40,7 +40,7 @@ reuse_queries: True            # True: reuse queries from key frame (experimenta
 non_key_decoder_layers: 1       # Number of layers for non-key decoder (1 or 3)
 
 # Training Settings
-epoches: 20
+epoches: 15
 clip_max_norm: 0.1
 
 # Learning Rate Scheduler (override)

@@ -210,7 +210,7 @@ class Phase1Trainer:
                     teacher_c3, teacher_c4, teacher_c5 = teacher_backbone_feats[-3:]
                     teacher_ccff = self.model.encoder([teacher_c3, teacher_c4, teacher_c5])
                 
-                # 2. THE STUDENT: Get standard outputs AND the fused student features
+                # 2. Get standard outputs and fused student features
                 outputs_non_key, student_fused = self.model.forward_non_key_frame(
                     img_non_key, target_non_key, return_fused=True
                 )
@@ -219,21 +219,32 @@ class Phase1Trainer:
                 loss_dict_non_key = self.criterion(outputs_non_key, target_non_key, cached_indices=key_indices)
                 loss_non_key_bbox = sum(loss_dict_non_key.values())
                 
-                # 4. Calculate KD Loss (MSE between student and teacher)
-                loss_kd = 0.0
-                for s_feat, t_feat in zip(student_fused, teacher_ccff):
-                    loss_kd += torch.nn.functional.smooth_l1_loss(s_feat, t_feat)
-                
-                # 5. Combine Losses
-                # (KD weight balances the tiny MSE values against the larger L1/GIoU bbox losses)
-                # Decay KD weight over time to allow more focus on bbox loss as training progresses
-                base_kd_weight = 5.0
-                current_kd_weight = base_kd_weight * (0.5 ** epoch)
-                loss_non_key = loss_non_key_bbox + (current_kd_weight * loss_kd)
-                
-                # outputs_non_key = self.model.forward_non_key_frame(img_non_key, target_non_key)
-                # loss_dict_non_key = self.criterion(outputs_non_key, target_non_key, cached_indices=key_indices)
-                # loss_non_key = sum(loss_dict_non_key.values())
+                # 4. KNOWLEDGE DISTILLATION GATE
+                # Only run KD if we are explicitly in freeze_key mode (Steps 3 & 4)
+                if self.training_strategy == 'freeze_key' and not self.same_frame:
+                    
+                    # Run teacher and get perfect features
+                    with torch.no_grad():
+                        teacher_backbone_feats = self.model.backbone(img_non_key)
+                        teacher_c3, teacher_c4, teacher_c5 = teacher_backbone_feats[-3:]
+                        teacher_ccff = self.model.encoder([teacher_c3, teacher_c4, teacher_c5])
+                    
+                    # Calculate KD Loss
+                    loss_kd = 0.0
+                    for s_feat, t_feat in zip(student_fused, teacher_ccff):
+                        loss_kd += torch.nn.functional.smooth_l1_loss(s_feat, t_feat)
+                    
+                    # Route the loss based on the phase
+                    if self.kd_only:
+                        # Step 2: 100% KD, ignore BBox
+                        loss_non_key = loss_kd
+                    else:
+                        # Step 3: Mostly BBox, slight KD regularization
+                        loss_non_key = loss_non_key_bbox + (0.1 * loss_kd)
+                else:
+                    # Step 1 (Same Frame / Joint): Pure BBox loss, no KD interference
+                    loss_non_key = loss_non_key_bbox
+
                 loss_non_key_value = loss_non_key.item()
                 
                 if loss is None:
@@ -512,9 +523,9 @@ def main():
     parser.add_argument('--alternate_interval', type=int, default=1,
                        help='Alternate strategy only: switch every N epochs')
     parser.add_argument('--pretrained', type=str, default=None,
-                       help='Path to pretrained key frame model')
-    parser.add_argument('--pretrained_temporal', type=str, default=None,
-                       help='Path to full temporal model from a previous curriculum round')
+                       help='Path to checkpoint (auto-detects key-only vs full temporal)')
+    parser.add_argument('--eval_only', action='store_true',
+                       help='Skip training and only run evaluation on the provided weights')
     
     # Debug mode
     parser.add_argument('--debug', action='store_true')
@@ -551,19 +562,34 @@ def main():
     try:
         model, cfg = build_model_from_config(args.config, device)
 
+        if args.init_weights:
+            model.lightweight_decoder.load_state_dict(model.decoder.state_dict(), strict=False)
+            print("Non-key decoder initialization complete.")
+        
         if args.pretrained:
-            load_pretrained_key_frame(model, args.pretrained, device)
-            print(f"Loaded pretrained weights from {args.pretrained}")
+            print(f"\n=> Inspecting weights from: {args.pretrained}")
+            checkpoint = torch.load(args.pretrained, map_location=device, weights_only=False)
+            
+            # Handle different checkpoint dictionary structures
+            state_dict = checkpoint.get('model_state_dict', checkpoint.get('model', checkpoint))
+            
+            # Auto-detect if these weights contain our temporal modules
+            is_temporal = any('fusion_blocks' in k for k in state_dict.keys())
+            
+            if is_temporal:
+                print("   [Auto-Detect] Full Temporal RT-DETR weights found. Loading strictly...")
+                model.load_state_dict(state_dict, strict=True)
+            else:
+                print("   [Auto-Detect] Standard Key-Frame RT-DETR weights found. Warm-starting...")
+                missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+                if missing_keys:
+                    print(f"   Missing keys (expected for new temporal modules): {len(missing_keys)}")
+            
+            print("   Success!")
 
         if args.init_weights:
             model.lightweight_decoder.load_state_dict(model.decoder.state_dict(), strict=False)
             print("Non-key decoder initialization complete.")
-
-        if args.pretrained_temporal:
-            checkpoint = torch.load(args.pretrained_temporal, map_location=device, weights_only=False)
-            state_dict = checkpoint.get('model_state_dict', checkpoint.get('model', checkpoint))
-            model.load_state_dict(state_dict)
-            print("Successfully loaded full temporal weights!")
         
         # Get config values (with overrides)
         epochs = args.epochs if args.epochs is not None else getattr(cfg, 'epoches', 50)
@@ -620,8 +646,25 @@ def main():
     
     # Get components from config
     criterion = cfg.criterion
-    optimizer = cfg.optimizer
-    lr_scheduler = cfg.lr_scheduler
+    # optimizer = cfg.optimizer
+    # lr_scheduler = cfg.lr_scheduler
+    # 1. FORCE AWAKE all temporal parameters so the optimizer sees them
+    for fusion_block in model.fusion_blocks:
+        for param in fusion_block.parameters():
+            param.requires_grad = True
+            
+    if hasattr(model, 'lightweight_decoder') and model.lightweight_decoder is not None:
+        for param in model.lightweight_decoder.parameters():
+            param.requires_grad = True
+
+    # 2. COLLECT all awake parameters
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+
+    # 3. BUILD the optimizer and scheduler cleanly
+    optimizer = torch.optim.AdamW(trainable_params, lr=1e-4, weight_decay=1e-4)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+    
+    print(f"   Registered {len(trainable_params)} parameter tensors to Optimizer.")
     
     # Resume
     start_epoch = 0
@@ -660,6 +703,22 @@ def main():
         alternate_interval=args.alternate_interval,
         same_frame=args.same_frame
     )
+    
+    if args.eval_only:
+        print("\n" + "="*80)
+        print("Executing EVALUATION ONLY Mode...")
+        print("="*80)
+        if val_dataloader is None:
+            print("❌ Error: No validation dataloader found in config.")
+            sys.exit(1)
+            
+        # Run evaluation with a dummy epoch 0
+        stats = trainer.evaluate(val_dataloader, epoch=0)
+        
+        print("\nFinal Evaluation Stats:")
+        for k, v in stats.items():
+            print(f"  {k}: {v:.4f}")
+        return  # Exit the main function gracefully
     
     # Training loop
     print("\n" + "="*80)
