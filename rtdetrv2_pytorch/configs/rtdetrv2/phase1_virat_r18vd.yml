@@ -7,8 +7,8 @@ __include__: [
 ]
 
 # Override output directory
-output_dir: './output/test'
-summary_dir: './output/test/summary'
+output_dir: './output/phase1_same_frame'
+summary_dir: './output/phase1_same_frame/summary'
 
 # Override to ResNet18
 PResNet:

@@ -4,6 +4,7 @@ Run with: python rtdetrv2_pytorch/tools/phase1_training.py -c rtdetrv2_pytorch/c
 """
 
 import os 
+from pyexpat import model
 import sys
 
 
@@ -27,6 +28,8 @@ from torchmetrics.detection.mean_ap import MeanAveragePrecision
 from src.zoo.temporal_rtdetr import TemporalRTDETR, ViratTemporalDataset
 from src.core import YAMLConfig
 from pycocotools.cocoeval import COCOeval
+
+from torch.utils.tensorboard import SummaryWriter
 
 class Phase1Trainer:
     """
@@ -563,8 +566,15 @@ def main():
         model, cfg = build_model_from_config(args.config, device)
 
         if args.init_weights:
-            model.lightweight_decoder.load_state_dict(model.decoder.state_dict(), strict=False)
-            print("Non-key decoder initialization complete.")
+            print("\n=> Initializing Lightweight Decoder from Heavy Decoder...")
+            if hasattr(model, 'lightweight_decoder') and model.lightweight_decoder is not None:
+                # Get the state dict of the LAST layer of the heavy transformer
+                heavy_last_layer_state = model.decoder.decoder.layers[-1].state_dict()
+                
+                # Force it into the FIRST (and only) layer of the lightweight transformer
+                model.lightweight_decoder.decoder.layers[0].load_state_dict(heavy_last_layer_state)
+                
+                print("   ✅ Successfully copied pre-trained heavy transformer layer!")
         
         if args.pretrained:
             print(f"\n=> Inspecting weights from: {args.pretrained}")
@@ -599,6 +609,10 @@ def main():
         print_freq = getattr(cfg, 'print_freq', 50)
         checkpoint_freq = getattr(cfg, 'checkpoint_freq', 5)
         clip_max_norm = getattr(cfg, 'clip_max_norm', 0.1)
+
+        summary_dir = getattr(cfg, 'summary_dir', os.path.join(output_dir, 'summary'))
+        writer = SummaryWriter(log_dir=summary_dir)
+        print(f"  Summary dir:      {summary_dir}")
         
         # Debug mode overrides
         if args.debug:
@@ -644,23 +658,22 @@ def main():
         traceback.print_exc()
         sys.exit(1)
     
-    # Get components from config
+    # Get criterion from config
     criterion = cfg.criterion
-    # optimizer = cfg.optimizer
-    # lr_scheduler = cfg.lr_scheduler
-    # 1. FORCE AWAKE all temporal parameters so the optimizer sees them
-    for fusion_block in model.fusion_blocks:
-        for param in fusion_block.parameters():
-            param.requires_grad = True
-            
-    if hasattr(model, 'lightweight_decoder') and model.lightweight_decoder is not None:
-        for param in model.lightweight_decoder.parameters():
-            param.requires_grad = True
 
-    # 2. COLLECT all awake parameters
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    print("\n=> Preparing Temporal Model for Optimizer Registration...")
+    
+    trainable_params = []
+        
+    # Iterate through every single parameter in the network by its string name
+    for name, param in model.named_parameters():
+        if 'fusion_blocks' in name:
+                param.requires_grad = True
+                trainable_params.append(param)
+        else:
+            param.requires_grad = False
 
-    # 3. BUILD the optimizer and scheduler cleanly
+    # 3. BUILD the custom optimizer
     optimizer = torch.optim.AdamW(trainable_params, lr=1e-4, weight_decay=1e-4)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
     
@@ -748,6 +761,13 @@ def main():
         lr_scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
         print(f"Learning rate: {current_lr:.6f}")
+
+        # Log all numeric metrics (Losses and mAPs) to TensorBoard
+        for k, v in metrics.items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                writer.add_scalar(f"Metrics/{k}", v, epoch)
+        
+        writer.add_scalar("Train/Learning_Rate", current_lr, epoch)
         
         # Save checkpoint
         if (epoch + 1) % checkpoint_freq == 0 or epoch == epochs - 1:
