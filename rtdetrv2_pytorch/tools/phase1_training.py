@@ -54,6 +54,7 @@ class Phase1Trainer:
         training_strategy: str = 'joint',
         alternate_interval: int = 1,
         same_frame: bool = False,
+        kd_only: bool = False,
     ):
         self.model = model
         self.criterion = criterion
@@ -70,6 +71,7 @@ class Phase1Trainer:
         self.training_strategy = training_strategy
         self.alternate_interval = alternate_interval
         self.same_frame = same_frame
+        self.kd_only = kd_only
         
         print(f"\nTraining Strategy: {training_strategy}")
         if training_strategy == 'alternate':
@@ -547,9 +549,10 @@ def main():
     
     parser.add_argument('--same_frame', action='store_true',
                        help='Diagnostic: Force non-key frame to be identical to key frame')
-    
     parser.add_argument('--init_weights', action='store_true', 
                        help='Warm start: Copy pretrained key decoder weights to non-key decoder')
+    parser.add_argument('--kd_only', action='store_true', 
+                       help='Only use KD loss (for Step 2 motion isolation)')
     
     args = parser.parse_args()
     
@@ -564,42 +567,28 @@ def main():
     # Load config and build model
     try:
         model, cfg = build_model_from_config(args.config, device)
-
-        if args.init_weights:
-            print("\n=> Initializing Lightweight Decoder from Heavy Decoder...")
-            if hasattr(model, 'lightweight_decoder') and model.lightweight_decoder is not None:
-                # Get the state dict of the LAST layer of the heavy transformer
-                heavy_last_layer_state = model.decoder.decoder.layers[-1].state_dict()
-                
-                # Force it into the FIRST (and only) layer of the lightweight transformer
-                model.lightweight_decoder.decoder.layers[0].load_state_dict(heavy_last_layer_state)
-                
-                print("   ✅ Successfully copied pre-trained heavy transformer layer!")
-        
+        # 1. FIRST: Load the pre-trained weights into the heavy model!
         if args.pretrained:
             print(f"\n=> Inspecting weights from: {args.pretrained}")
             checkpoint = torch.load(args.pretrained, map_location=device, weights_only=False)
-            
-            # Handle different checkpoint dictionary structures
             state_dict = checkpoint.get('model_state_dict', checkpoint.get('model', checkpoint))
-            
-            # Auto-detect if these weights contain our temporal modules
             is_temporal = any('fusion_blocks' in k for k in state_dict.keys())
             
             if is_temporal:
-                print("   [Auto-Detect] Full Temporal RT-DETR weights found. Loading strictly...")
+                print("   [Auto-Detect] Full Temporal weights found. Loading strictly...")
                 model.load_state_dict(state_dict, strict=True)
             else:
-                print("   [Auto-Detect] Standard Key-Frame RT-DETR weights found. Warm-starting...")
-                missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-                if missing_keys:
-                    print(f"   Missing keys (expected for new temporal modules): {len(missing_keys)}")
-            
+                print("   [Auto-Detect] Standard Key-Frame weights found. Warm-starting...")
+                model.load_state_dict(state_dict, strict=False)
             print("   Success!")
 
+        # 2. SECOND: Now that heavy model is smart, copy it to the lightweight layer!
         if args.init_weights:
-            model.lightweight_decoder.load_state_dict(model.decoder.state_dict(), strict=False)
-            print("Non-key decoder initialization complete.")
+            print("\n=> Initializing Lightweight Decoder from Heavy Decoder...")
+            if hasattr(model, 'lightweight_decoder') and model.lightweight_decoder is not None:
+                heavy_last_layer_state = model.decoder.decoder.layers[-1].state_dict()
+                model.lightweight_decoder.decoder.layers[0].load_state_dict(heavy_last_layer_state)
+                print("   ✅ Successfully copied perfectly trained heavy transformer layer!")
         
         # Get config values (with overrides)
         epochs = args.epochs if args.epochs is not None else getattr(cfg, 'epoches', 50)
@@ -665,15 +654,15 @@ def main():
     
     trainable_params = []
         
-    # Iterate through every single parameter in the network by its string name
+    # Iterate through every single parameter in the network
     for name, param in model.named_parameters():
-        if 'fusion_blocks' in name:
-                param.requires_grad = True
-                trainable_params.append(param)
+        if 'fusion_blocks' in name or 'lightweight_decoder.decoder' in name:
+            param.requires_grad = True
+            trainable_params.append(param)
         else:
             param.requires_grad = False
 
-    # 3. BUILD the custom optimizer
+    # BUILD the custom optimizer
     optimizer = torch.optim.AdamW(trainable_params, lr=1e-4, weight_decay=1e-4)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
     
