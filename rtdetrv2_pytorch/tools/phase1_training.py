@@ -21,9 +21,6 @@ from src.data import CocoEvaluator
 from src.misc import MetricLogger
 from src.core._config import BaseConfig
 
-from torchmetrics.detection.mean_ap import MeanAveragePrecision
-
-
 # Import to register classes BEFORE loading config
 from src.zoo.temporal_rtdetr import TemporalRTDETR, ViratTemporalDataset
 from src.core import YAMLConfig
@@ -202,56 +199,59 @@ class Phase1Trainer:
                 loss_key_value = loss_key.item()
 
             if train_non_key:
+                # 1. THE TEACHER: Get the perfect Key frame outputs
                 if not train_key:
                     with torch.no_grad():
                         outputs_key = self.model.forward_key_frame(img_key, target_key)
                         _, key_indices = self.criterion(
                             outputs_key, target_key, return_indices=True
                         )
-
-                # 1. THE TEACHER: Run non-key image through frozen heavy encoder
-                with torch.no_grad():
-                    teacher_backbone_feats = self.model.backbone(img_non_key)
-                    teacher_c3, teacher_c4, teacher_c5 = teacher_backbone_feats[-3:]
-                    teacher_ccff = self.model.encoder([teacher_c3, teacher_c4, teacher_c5])
                 
-                # 2. Get standard outputs and fused student features
-                outputs_non_key, student_fused = self.model.forward_non_key_frame(
-                    img_non_key, target_non_key, return_fused=True
+                # 2. THE STUDENT: Get the non-key frame outputs
+                # (Notice we don't need return_fused=True anymore, Output KD is much cleaner)
+                outputs_non_key = self.model.forward_non_key_frame(
+                    img_non_key, target_non_key
                 )
                 
-                # 3. Calculate standard bounding box loss
-                loss_dict_non_key = self.criterion(outputs_non_key, target_non_key, cached_indices=key_indices)
-                loss_non_key_bbox = sum(loss_dict_non_key.values())
-                
-                # 4. KNOWLEDGE DISTILLATION GATE
-                # Only run KD if we are explicitly in freeze_key mode (Steps 3 & 4)
-                if self.training_strategy == 'freeze_key' and not self.same_frame:
+                # 3. LOSS ROUTING
+                if getattr(self, 'kd_only', False):
+                    import torch.nn.functional as F
                     
-                    # Run teacher and get perfect features
-                    with torch.no_grad():
-                        teacher_backbone_feats = self.model.backbone(img_non_key)
-                        teacher_c3, teacher_c4, teacher_c5 = teacher_backbone_feats[-3:]
-                        teacher_ccff = self.model.encoder([teacher_c3, teacher_c4, teacher_c5])
+                    # --- OUTPUT-LEVEL KNOWLEDGE DISTILLATION ---
+                    # The Teacher's perfect answers (detached for mathematical safety)
+                    teacher_boxes = outputs_key['pred_boxes'].detach()
+                    teacher_logits = outputs_key['pred_logits'].detach()
                     
-                    # Calculate KD Loss
-                    loss_kd = 0.0
-                    for s_feat, t_feat in zip(student_fused, teacher_ccff):
-                        loss_kd += torch.nn.functional.smooth_l1_loss(s_feat, t_feat)
+                    # The Student's current attempts
+                    student_boxes = outputs_non_key['pred_boxes']
+                    student_logits = outputs_non_key['pred_logits']
                     
-                    # Route the loss based on the phase
-                    if self.kd_only:
-                        # Step 2: 100% KD, ignore BBox
-                        loss_non_key = loss_kd
-                    else:
-                        # Step 3: Mostly BBox, slight KD regularization
-                        loss_non_key = loss_non_key_bbox + (0.1 * loss_kd)
+                    # Force the 1-layer shortcut to exactly mimic the 3-layer teacher
+                    loss_kd_boxes = F.l1_loss(student_boxes, teacher_boxes)
+                    loss_kd_logits = F.mse_loss(student_logits, teacher_logits)
+                    
+                    # Heavily weight the bounding box mimicry
+                    loss_non_key = (loss_kd_boxes * 5.0) + (loss_kd_logits * 1.0)
+                    
+                    # For tensorboard logging
+                    loss_dict_non_key = {
+                        'loss_kd_boxes': loss_kd_boxes.item(), 
+                        'loss_kd_logits': loss_kd_logits.item()
+                    }
                 else:
-                    # Step 1 (Same Frame / Joint): Pure BBox loss, no KD interference
-                    loss_non_key = loss_non_key_bbox
+                    # --- STANDARD COCO HUNGARIAN LOSS ---
+                    loss_dict_non_key = self.criterion(
+                        outputs_non_key, target_non_key, cached_indices=key_indices
+                    )
+                    weight_dict = self.criterion.weight_dict
+                    loss_non_key = sum(
+                        loss_dict_non_key[k] * weight_dict[k] 
+                        for k in loss_dict_non_key.keys() if k in weight_dict
+                    )
 
-                loss_non_key_value = loss_non_key.item()
+                loss_non_key_value = loss_non_key.item() if isinstance(loss_non_key, torch.Tensor) else loss_non_key
                 
+                # 4. ACCUMULATE
                 if loss is None:
                     loss = self.lambda_non_key * loss_non_key
                 else:
@@ -654,7 +654,6 @@ def main():
     
     trainable_params = []
         
-    # Iterate through every single parameter in the network
     for name, param in model.named_parameters():
         if 'fusion_blocks' in name or 'lightweight_decoder.decoder' in name:
             param.requires_grad = True
@@ -662,10 +661,8 @@ def main():
         else:
             param.requires_grad = False
 
-    # BUILD the custom optimizer
     optimizer = torch.optim.AdamW(trainable_params, lr=1e-4, weight_decay=1e-4)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
-    
     print(f"   Registered {len(trainable_params)} parameter tensors to Optimizer.")
     
     # Resume
