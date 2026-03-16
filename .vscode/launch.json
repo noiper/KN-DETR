@@ -12,8 +12,7 @@
             "args": [
                 "-c",
                 "rtdetrv2_pytorch/configs/rtdetrv2/phase1_virat_r18vd.yml",
-                "--debug",
-                "--weights",
+                "--pretrained",
                 "best.pth",
                 "--training_strategy",
                 "joint"
@@ -23,44 +22,6 @@
                 "PYTHONPATH": "${workspaceFolder}/rtdetrv2_pytorch/src",
                 "CUDA_VISIBLE_DEVICES": "" 
             }
-        },
-        {
-            "name": "Test Eval",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${workspaceFolder}/rtdetrv2_pytorch/tools/test_best_pth_simple.py",
-            "console": "integratedTerminal",
-            "justMyCode": false,
-            "python": "/home/robin/miniconda3/envs/rtdetr/bin/python",
-            "args": [
-                "-c",
-                "rtdetrv2_pytorch/configs/rtdetrv2/phase1_virat_r18vd.yml",
-                // "--debug",
-            ],
-            "cwd": "${workspaceFolder}",
-            "env": {
-                "PYTHONPATH": "${workspaceFolder}/rtdetrv2_pytorch/src",
-            }
-        },
-        {
-            "name": "Test Eval COCO",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${workspaceFolder}/rtdetrv2_pytorch/tools/train.py",
-            "console": "integratedTerminal",
-            "justMyCode": false,
-            "python": "/home/robin/miniconda3/envs/rtdetr/bin/python",
-            "args": [
-                "-c",
-                "rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r18vd_virat.yml",
-                "--test-only",
-                "--resume",
-                "best.pth",
-            ],
-            "cwd": "${workspaceFolder}",
-            "env": {
-                "PYTHONPATH": "${workspaceFolder}/rtdetrv2_pytorch/src",
-            }
-        },
+        }
     ]
 }
