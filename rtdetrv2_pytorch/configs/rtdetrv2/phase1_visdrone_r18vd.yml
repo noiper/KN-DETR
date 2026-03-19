@@ -1,14 +1,14 @@
-# Phase 1 Temporal RT-DETR Training Configuration for VIRAT Dataset
+# Phase 1 Temporal RT-DETR Training Configuration for Visdrone Dataset
 
 __include__: [
-  '../dataset/virat_phase1_detection.yml',
+  '../dataset/visdrone_phase1_detection.yml',
   './include/optimizer.yml',
   './include/rtdetrv2_r50vd.yml',  # Include R50 base, then override to R18
 ]
 
 # Override output directory
-output_dir: './output/debug'
-summary_dir: './output/debug/summary'
+output_dir: './output/phase1_visdrone_same_frame'
+summary_dir: './output/phase1_visdrone_same_frame/summary'
 
 # Override to ResNet18
 PResNet:

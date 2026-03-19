@@ -8,16 +8,12 @@ __include__:  [
 
 tuning:  ./rtdetrv2_r18vd_120e_coco.pth
 
-output_dir: ./output/rtdetrv2_r18vd_visdrone_v4
+output_dir: ./output/rtdetrv2_r18vd_visdrone
 
 num_classes: 11
 
-# ⭐ KEY CHANGE: Only freeze early stages
 PResNet:  
   depth: 18
-  freeze_at: 1              # ⭐ Only freeze stage 1 (was 4!)
-  freeze_norm: False        # ⭐ Allow BN to adapt
-  pretrained: False
 
 HybridEncoder:
   in_channels: [128, 256, 512]
@@ -27,57 +23,47 @@ HybridEncoder:
 RTDETRTransformerv2:
   num_layers: 3
 
-# ⭐ More epochs since we're training more
-epoches: 40                 # Increased from 20
+epoches: 10
 
-# ⭐ Differential LR for unfrozen backbone
 optimizer: 
   type: AdamW
   params: 
-    # Unfrozen backbone stages 2-4 - small LR
     - 
       params: '^(?=.*backbone\.layer[234])(?!.*(?:norm|bn)).*$'
-      lr: 0.000005          # ⭐ Very small (5e-6)
-    # Backbone norms - small LR, no decay
+      lr: 0.000005
     - 
       params:  '^(?=.*backbone)(?=.*(?:norm|bn)).*$'
-      lr: 0.000005
       weight_decay: 0.
-    # Encoder/Decoder norms - no decay
     - 
       params:  '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn)).*$'
       weight_decay: 0.
   
-  lr:  0.0001                # Encoder/decoder
+  lr: 0.00005
   betas: [0.9, 0.999]
   weight_decay: 0.0001
 
-# ⭐ Adjusted LR schedule
 lr_scheduler:
   type: MultiStepLR
-  milestones: [25, 35]      # Later milestones
+  milestones: [40, 50]
   gamma: 0.1
 
 lr_warmup_scheduler:  
   type: LinearWarmup
   warmup_duration: 5        # Longer warmup
 
-# ⭐ CRITICAL:  Add multi-scale training for small objects
-train_dataloader:
+train_dataloader: 
+  total_batch_size: 16
+  shuffle: true
+  num_workers: 4
+  drop_last: true
   dataset: 
     transforms:
-      policy: 
-        epoch:  35
-  collate_fn: 
-    scales: [
-      [480, 480],
-      [512, 512],
-      [544, 544],
-      [576, 576],
-      [608, 608],
-      [640, 640],
-      [672, 672],
-      [704, 704],
-      [736, 736]
-    ]
-    stop_epoch: 35
+      policy:
+        name: stop_epoch
+        epoch: 55
+        ops: ['RandomPhotometricDistort', 'RandomZoomOut', 'RandomIoUCrop', 'RandomHorizontalFlip']
+  collate_fn:
+    scales: ~
+
+val_dataloader:
+  total_batch_size: 16
