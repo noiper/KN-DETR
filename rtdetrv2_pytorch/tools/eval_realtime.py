@@ -109,8 +109,9 @@ def main():
     coco_gt = val_dataloader.dataset.coco
     postprocessor = cfg.postprocessor
     
-    # Accumulator for Combined mAP only
-    results_combined = []
+    # Separate lists for Key and Non-Key frames
+    res_key = []
+    res_nk = []
     
     # Tracking Metrics
     metrics = {
@@ -120,7 +121,7 @@ def main():
 
     print("\n--- INITIATING REAL-TIME STREAM SIMULATION ---")
     with torch.no_grad():
-        for i, batch in enumerate(tqdm(val_dataloader, desc="Streaming Video (bs=1)")):
+        for i, batch in enumerate(tqdm(val_dataloader, desc="Streaming Video")):
             img_key, target_key, img_non_key, target_non_key = batch
             
             # ==========================================
@@ -148,7 +149,7 @@ def main():
                     metrics['k_mem'] += torch.cuda.max_memory_allocated() / (1024 ** 2)
                 
             orig_sizes_k = torch.stack([t["orig_size"] for t in target_key], dim=0).to(device)
-            format_coco(target_key, postprocessor(out_k, orig_sizes_k), results_combined)
+            format_coco(target_key, postprocessor(out_k, orig_sizes_k), res_key)
             
             # ==========================================
             # STEP 2: NON-KEY FRAME ARRIVES (Light Inference)
@@ -176,7 +177,10 @@ def main():
                         metrics['nk_mem'] += torch.cuda.max_memory_allocated() / (1024 ** 2)
                     
                 orig_sizes_nk = torch.stack([t["orig_size"] for t in target_non_key], dim=0).to(device)
-                format_coco(target_non_key, postprocessor(out_nk, orig_sizes_nk), results_combined)
+                format_coco(target_non_key, postprocessor(out_nk, orig_sizes_nk), res_nk)
+
+    # Combine results for overall evaluation
+    results_combined = res_key + res_nk
 
     # Calculate Averages
     avg_k_time = (metrics['k_time'] / metrics['k_frames']) * 1000 if metrics['k_frames'] else 0
@@ -189,7 +193,9 @@ def main():
     print("REAL-TIME PERFORMANCE REPORT")
     print("="*60)
     
-    # Only report the true, combined mAP
+    # Evaluate individual and combined mAPs
+    map_k = evaluate_map(coco_gt, res_key, "HEAVY KEY MODEL ONLY")
+    map_nk = evaluate_map(coco_gt, res_nk, "LIGHTWEIGHT NON-KEY MODEL ONLY")
     combined_map = evaluate_map(coco_gt, results_combined, "COMBINED OVERALL AVERAGE")
     
     print("\n" + "="*60)
@@ -198,10 +204,12 @@ def main():
     print(f"  Combined System Accuracy (mAP):  {combined_map:.4f}\n")
     
     print(f"[ KEY FRAME - Heavy Pathway ]")
+    print(f"  Accuracy (mAP):  {map_k:.4f}")
     print(f"  Latency:         {avg_k_time:.2f} ms")
     print(f"  Peak VRAM:       {avg_k_mem:.2f} MB\n")
     
     print(f"[ NON-KEY FRAME - Light Pathway ]")
+    print(f"  Accuracy (mAP):  {map_nk:.4f}")
     print(f"  Latency:         {avg_nk_time:.2f} ms")
     print(f"  Peak VRAM:       {avg_nk_mem:.2f} MB\n")
     

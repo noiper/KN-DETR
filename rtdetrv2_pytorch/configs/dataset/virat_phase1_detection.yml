@@ -49,8 +49,8 @@ val_dataloader:
     root_dir: ../dataset/VIRAT/val_videos/
     ann_file: ../dataset/VIRAT/val.json
     max_frame_gap: 1
-    pair_sampling_strategy: "fixed_gap"
-    frame_stride: 1
+    pair_sampling_strategy: "stride" # For testing only
+    frame_stride: 2 # For testing only
     transforms:
       type: Compose
       ops: 

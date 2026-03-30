@@ -22,6 +22,25 @@
                 "PYTHONPATH": "${workspaceFolder}/rtdetrv2_pytorch/src",
                 "CUDA_VISIBLE_DEVICES": "" 
             }
+        },
+                {
+            "name": "Evaluate Real Time",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/rtdetrv2_pytorch/tools/eval_realtime.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "python": "/home/robin/miniconda3/envs/rtdetr/bin/python",
+            "args": [
+                "-c",
+                "rtdetrv2_pytorch/configs/rtdetrv2/phase1_virat_r18vd.yml",
+                "-w",
+                "output/phase1_decoder/best_model.pth"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/rtdetrv2_pytorch/src",
+            }
         }
     ]
 }
