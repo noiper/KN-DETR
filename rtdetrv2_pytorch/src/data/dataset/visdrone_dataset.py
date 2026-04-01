@@ -13,6 +13,8 @@ from ._dataset import DetDataset
 from .._misc import convert_to_tv_tensor
 from ... core import register
 
+from pycocotools.coco import COCO
+
 @register()
 class VisdroneVIDDetection(DetDataset):
     """
@@ -96,6 +98,52 @@ class VisdroneVIDDetection(DetDataset):
                 f"3. Video folders are present in root_dir\n"
                 f"4. Annotation . txt files are present in ann_dir"
             )
+        
+        self.coco = self._build_coco_api()
+        
+    def _build_coco_api(self):
+        """Builds an in-memory COCO object for the evaluator."""
+        coco = COCO()
+        dataset = {'images': [], 'annotations': [], 'categories': []}
+        
+        # 1. Map Categories
+        for i, name in enumerate(self.CLASSES):
+            dataset['categories'].append({'id': i, 'name': name, 'supercategory': 'none'})
+            
+        ann_id = 1
+        
+        # 2. Map Images and Annotations
+        for idx, sample in enumerate(self.samples):
+            # The image_id must match the 'idx' yielded in load_item()
+            dataset['images'].append({
+                'id': idx, 
+                'file_name': sample['image_path'],
+                'width': 0,   # Not strictly needed by COCOeval if bboxes are accurate
+                'height': 0
+            })
+            
+            for ann in sample['annotations']:
+                x, y, w, h = ann['bbox']
+                category = ann['category']
+                score = ann['score']
+                
+                # Apply the exact same filtering rules as load_item()
+                if category == 0 or w <= 0 or h <= 0 or score == 0:
+                    continue
+                    
+                dataset['annotations'].append({
+                    'id': ann_id,
+                    'image_id': idx,
+                    'category_id': category,
+                    'bbox': [x, y, w, h],
+                    'area': w * h,
+                    'iscrowd': 0
+                })
+                ann_id += 1
+                
+        coco.dataset = dataset
+        coco.createIndex()
+        return coco
     
     def _load_video_annotations(self, video_name):
         """Load all annotations for a video into a dictionary keyed by frame index"""

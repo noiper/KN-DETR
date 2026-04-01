@@ -280,6 +280,8 @@ class Phase1Trainer:
             for i in range(len(scores)):
                 x1, y1, x2, y2 = boxes[i]
                 w, h = x2 - x1, y2 - y1
+                # Both VisDrone and VIRAT: model predictions match GT category format
+                # VisDrone: 1-10, VIRAT: 0-4
                 results_list.append({
                     "image_id": image_id,
                     "category_id": int(labels[i]),

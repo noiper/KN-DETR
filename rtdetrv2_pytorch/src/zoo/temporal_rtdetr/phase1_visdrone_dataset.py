@@ -59,6 +59,9 @@ class VisDroneTemporalDataset(CocoDetection):
         self.pairs = []
         self._build_pairs()
         print(f"Generated {len(self.pairs)} temporal pairs using '{self.pair_sampling_strategy}'.")
+        
+        # Note: self.coco from parent (CocoDetection) uses original 1-indexed categories (1-11)
+        # The model outputs 1-indexed labels, so we keep COCO as-is for evaluation
 
     def _build_pairs(self):
         """Generates (key_id, non_key_id) tuples based on the strategy"""
@@ -104,6 +107,8 @@ class VisDroneTemporalDataset(CocoDetection):
             iscrowd = torch.zeros((0,), dtype=torch.int64)
         else:
             boxes = torch.tensor([obj['bbox'] for obj in target], dtype=torch.float32)
+            # torchvision CocoDetection returns category_ids as-is from JSON (1-10 for VisDrone)
+            # Keep them unchanged - matches pretrained model output range
             labels = torch.tensor([obj['category_id'] for obj in target], dtype=torch.int64)
             area = torch.tensor([obj['area'] for obj in target], dtype=torch.float32)
             iscrowd = torch.tensor([obj.get('iscrowd', 0) for obj in target], dtype=torch.int64)
@@ -117,7 +122,8 @@ class VisDroneTemporalDataset(CocoDetection):
         res_target['labels'] = labels
         res_target['area'] = area
         res_target['iscrowd'] = iscrowd
-        res_target['orig_size'] = torch.tensor([h, w])
+        # Note: orig_size should be [width, height] to match postprocessor expectations
+        res_target['orig_size'] = torch.tensor([w, h])
         res_target['size'] = torch.tensor([h, w])
             
         return img, res_target
