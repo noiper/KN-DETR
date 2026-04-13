@@ -144,11 +144,13 @@ class ViratTemporalDataset(Dataset):
     def _build_pairs_all(self) -> List[Tuple[Dict, Dict]]:
         """
         Strategy: 'all'
-        Sample ALL possible gaps from 1 to max_frame_gap
+        Sample ALL possible gaps from 1 to max_frame_gap, respecting frame_stride
         """
         samples = []
         for _, frames in self.video_frames.items():
-            for i, frame_t in enumerate(frames):
+            # Use range to respect frame_stride!
+            for i in range(0, len(frames), self.frame_stride):
+                frame_t = frames[i]
                 max_offset = min(self.max_frame_gap + 1, len(frames) - i)
                 for s in range(1, max_offset):
                     frame_t_s = frames[i + s]

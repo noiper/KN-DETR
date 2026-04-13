@@ -7,8 +7,8 @@ __include__: [
 ]
 
 # Override output directory
-output_dir: './output/phase1_visdrone_331'
-summary_dir: './output/phase1_visdrone_331/summary'
+output_dir: './output/test'
+summary_dir: './output/test/summary'
 
 # Override to ResNet18
 PResNet:
@@ -40,7 +40,7 @@ reuse_queries: True            # True: reuse queries from key frame (experimenta
 non_key_decoder_layers: 1       # Number of layers for non-key decoder (1 or 3)
 
 # Training Settings
-epoches: 5
+epoches: 50
 clip_max_norm: 0.1
 
 # Learning Rate Scheduler (override)
@@ -50,7 +50,7 @@ lr_scheduler:
   gamma: 0.1
 
 # Logging and Checkpointing
-print_freq: 50
+print_freq: 1000
 checkpoint_freq: 1
 
 # Random seed

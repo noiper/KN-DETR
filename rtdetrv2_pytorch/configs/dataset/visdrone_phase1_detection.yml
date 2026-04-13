@@ -49,8 +49,10 @@ val_dataloader:
     root_dir: ../dataset/VisDrone/VisDrone2019-VID-val/sequences/
     ann_file: ../dataset/VisDrone/val.json
     max_frame_gap: 1
+    # pair_sampling_strategy: "random_single"
+    # frame_stride: 1
     pair_sampling_strategy: "fixed_gap"
-    frame_stride: 1
+    frame_stride: 2
     transforms:
       type: Compose
       ops: 
