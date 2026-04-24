@@ -1,5 +1,5 @@
 __include__: [
-  '../dataset/virat_detection.yml',
+  '../dataset/mot17_detection.yml',
   '../runtime.yml',
   './include/dataloader.yml',
   './include/optimizer.yml',
@@ -7,9 +7,9 @@ __include__: [
 ]
 
 tuning: ./rtdetrv2_r18vd_120e_coco.pth
-output_dir: ./output/rtdetrv2_r18vd_virat
+output_dir: ./output/rtdetrv2_r18vd_mot17
 
-num_classes: 2
+num_classes: 1
 
 # ResNet-18 backbone
 PResNet: 
@@ -29,7 +29,7 @@ RTDETRTransformerv2:
   num_denoising: 0
   dropout: 0.1
 
-epoches: 10
+epoches: 50
 use_focal_loss: True
 
 optimizer:

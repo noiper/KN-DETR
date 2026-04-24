@@ -55,14 +55,6 @@ class DetSolver(BaseSolver):
             
             self.last_epoch += 1
 
-            if self.output_dir:
-                checkpoint_paths = [self.output_dir / 'last.pth']
-                # extra checkpoint before LR drop and every 100 epochs
-                if (epoch + 1) % args.checkpoint_freq == 0:
-                    checkpoint_paths.append(self.output_dir / f'checkpoint{epoch:04}.pth')
-                for checkpoint_path in checkpoint_paths:
-                    dist_utils.save_on_master(self.state_dict(), checkpoint_path)
-
             module = self.ema.module if self.ema else self.model
             test_stats, coco_evaluator = evaluate(
                 module, 
@@ -72,6 +64,27 @@ class DetSolver(BaseSolver):
                 self.evaluator, 
                 self.device
             )
+
+            if self.output_dir:
+                try:
+                    # RT-DETR stores AP metrics inside 'coco_eval_bbox'
+                    stats = test_stats.get('coco_eval_bbox', test_stats)
+                    map5095 = stats[0] # Index 0 is AP@0.50:0.95
+                    map50 = stats[1] # Index 1 is AP@0.50
+                    
+                    # Format as: epoch_AP@0.50:0.95_mAP50.pth
+                    file_name = f"{epoch:02d}_{int(map5095 * 1000):03d}_{int(map50 * 1000):03d}.pth"
+                except (KeyError, IndexError, TypeError):
+                    # Fallback in case evaluation was skipped or failed
+                    file_name = f"checkpoint{epoch:04d}.pth"
+                
+                checkpoint_paths = [self.output_dir / 'last.pth']
+                
+                if (epoch + 1) % args.checkpoint_freq == 0:
+                    checkpoint_paths.append(self.output_dir / file_name)
+                    
+                for checkpoint_path in checkpoint_paths:
+                    dist_utils.save_on_master(self.state_dict(), checkpoint_path)
 
             # TODO 
             for k in test_stats:

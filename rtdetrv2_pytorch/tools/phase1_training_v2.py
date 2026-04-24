@@ -19,7 +19,6 @@ from typing import Dict
 
 from src.core._config import BaseConfig
 
-# Import to register classes BEFORE loading config
 from src.zoo.temporal_rtdetr import TemporalRTDETR
 from src.core import YAMLConfig
 from pycocotools.cocoeval import COCOeval
@@ -29,9 +28,13 @@ from torch.utils.tensorboard import SummaryWriter
 class Phase1Trainer:
     """
     Training Strategies:
-    - 'alternate': Alternate between key and non-key frame training (like Faster R-CNN)
-    - 'freeze_key': Freeze key frame path, only train non-key path
-    - 'joint': Train both paths together (dafault)
+    --- The Two-Stage Curriculum ---
+    - 'kd_only': Stage 1 - Train fusion blocks via Feature MSE. (same_frame disabled)
+    - 'decoder_only': Stage 2 - Train light decoder via Hungarian. (same_frame disabled)
+    
+    --- Legacy & Diagnostic Modes ---
+    - 'freeze_key': Train fusion + light decoder via Hungarian. (same_frame supported)
+    - 'joint': Train fusion + light decoder + key decoder via Hungarian. (same_frame supported)
     """
     def __init__(
         self,
@@ -47,9 +50,7 @@ class Phase1Trainer:
         print_freq: int = 50,
         clip_max_norm: float = 0.1,
         training_strategy: str = 'joint',
-        alternate_interval: int = 1,
         same_frame: bool = False,
-        kd_only: bool = False,
     ):
         self.model = model
         self.criterion = criterion
@@ -64,82 +65,25 @@ class Phase1Trainer:
         self.print_freq = print_freq
         self.clip_max_norm = clip_max_norm
         self.training_strategy = training_strategy
-        self.alternate_interval = alternate_interval
         self.same_frame = same_frame
-        self.kd_only = kd_only
         
-        print(f"\nTraining Strategy: {training_strategy}")
-        if training_strategy == 'alternate':
-            print(f"  Alternate interval: {alternate_interval} epoch(s)")
-            print(f"  Note: Backbone/Encoder/Fusion shared, only decoder alternates")
-        elif training_strategy == 'freeze_key':
-            # Freeze key frame path
-            for param in self.model.backbone.parameters():
-                param.requires_grad = False
-            for param in self.model.encoder.parameters():
-                param.requires_grad = False
-            for param in self.model.decoder.parameters():
-                param.requires_grad = False
-            
-            # Ensure fusion block and lightweight decoder are trainable
-            for _, fusion_block in enumerate(self.model.fusion_blocks):
-                for param in fusion_block.parameters():
-                    param.requires_grad = True
-            
-            # Ensure lightweight decoder's own layers are trainable (if it exists)
-            # Note: The shared heads (dec_score_head, dec_bbox_head, input_proj, query_pos_head)
-            # are trained via the key-frame path since they reference the full decoder's heads.
-            if hasattr(self.model, 'lightweight_decoder') and self.model.lightweight_decoder is not None:
-                for name, param in self.model.lightweight_decoder.named_parameters():
-                    # Only set the decoder's OWN transformer layers trainable here
-                    # The shared heads' requires_grad is already set by the optimizer setup
-                    if 'decoder.' in name:
-                        param.requires_grad = True
-    
-        elif training_strategy == 'joint':
-            for param in self.model.encoder.parameters():
-                param.requires_grad = False
-            print(f"  Training both key and non-key paths jointly")
-        else:
-            raise ValueError(f"Invalid strategy: {training_strategy}")
-        
-    def _set_decoder_trainable(self, trainable: bool):
-        """Enable/disable gradient for decoder only"""
-        for param in self.model.decoder.parameters():
-            param.requires_grad = trainable
-    
+        valid_strategies = ['kd_only', 'decoder_only', 'freeze_key', 'joint']
+        if self.training_strategy not in valid_strategies:
+            raise ValueError(f"Unknown training strategy: {self.training_strategy}. Must be one of {valid_strategies}")
+        if self.same_frame and self.training_strategy in ['kd_only', 'decoder_only']:
+            print(f"  [Warning] --same_frame is not supported for '{self.training_strategy}'. Disabling it.")
+            self.same_frame = False
+
+        print(f"\nTraining Strategy: {self.training_strategy}")
+        if self.same_frame:
+            print("--same_frame is active.")
+
     def train_one_epoch(self, epoch: int) -> Dict[str, float]:
         """
         Train one epoch with temporal frame pairs
         """
         self.model.train()
-        
-        # Determine training mode for this epoch
-        if self.training_strategy == 'alternate':
-            epoch_cycle = epoch // self.alternate_interval
-            train_key = (epoch_cycle % 2 == 0)
-            train_non_key = not train_key
-            
-            if train_key:
-                print(f"  Training mode: Key frame (backbone/encoder/decoder)")
-                self._set_decoder_trainable(True)
-            else:
-                print(f"  Training mode: Non-key frame (backbone/encoder, decoder frozen)")
-                self._set_decoder_trainable(False)
-                
-        elif self.training_strategy == 'freeze_key':
-            train_key = False
-            train_non_key = True
-            
-        elif self.training_strategy == 'joint':
-            # Train both paths together
-            print(f"  Training mode: Joint training (both paths)")
-            self._set_decoder_trainable(True)
-            train_key = True
-            train_non_key = True
-        else:
-            raise ValueError(f"Unknown training strategy: {self.training_strategy}")
-        
+
         total_loss = 0.0
         total_loss_key = 0.0
         total_loss_non_key = 0.0
@@ -166,113 +110,91 @@ class Phase1Trainer:
             loss_key_value = 0.0
             loss_non_key_value = 0.0
             
-            if train_key:
+            # 1. KEY FRAME PATH (The Teacher)
+            if self.training_strategy == 'joint':
                 outputs_key = self.model.forward_key_frame(img_key, target_key)
                 loss_dict_key, key_indices = self.criterion(
                     outputs_key, target_key, return_indices=True
                 )
-
-                # Remove all aux loss
-                final_loss_dict = {}
-                for k, v in loss_dict_key.items():
-                    # 1. Drop Multi-layer / Aux losses (keys ending in a number like _0, _1, _2)
-                    if k[-1].isdigit():
-                        continue
-                        
-                    # 2. Drop Denoising (DN) losses (keys containing 'dn')
-                    if 'dn' in k:
-                        continue
-                        
-                    # 3. Keep ONLY the final layer's main outputs
-                    # (Usually 'loss_vfl', 'loss_bbox', 'loss_giou')
-                    final_loss_dict[k] = v
-    
+                # Remove all aux loss (drop multi-layer and DN losses)
+                final_loss_dict = {
+                    k: v for k, v in loss_dict_key.items() 
+                    if not (k[-1].isdigit() or 'dn' in k)
+                }
                 loss_key = sum(final_loss_dict.values())
                 loss = loss_key
                 loss_key_value = loss_key.item()
-
-            if train_non_key:
-                # 1. THE TEACHER: Get the perfect Key frame outputs
-                if not train_key:
-                    with torch.no_grad():
-                        outputs_key = self.model.forward_key_frame(img_key, target_key)
-                        _, key_indices = self.criterion(
-                            outputs_key, target_key, return_indices=True
-                        )
-
-                # 2. LOSS ROUTING
-                if getattr(self, 'kd_only', False):
-                    import torch.nn.functional as F
-                    
-                    # --- FEATURE-LEVEL KNOWLEDGE DISTILLATION ---
-                    with torch.no_grad():
-                        teacher_backbone_feats = self.model.backbone(img_non_key)
-                        teacher_c3, teacher_c4, teacher_c5 = teacher_backbone_feats[-3:]
-                        teacher_ccff = self.model.encoder([teacher_c3, teacher_c4, teacher_c5])
-                    
-                    # Student: Get fused features before they enter the 1-layer decoder
-                    outputs_non_key, student_fused = self.model.forward_non_key_frame(
-                        img_non_key, target_non_key, return_fused=True
-                    )
-                    
-                    # Calculate pure Feature MSE Loss (ignoring Hungarian BBox loss)
-                    loss_kd = 0.0
-                    for s_feat, t_feat in zip(student_fused, teacher_ccff):
-                        loss_kd += F.mse_loss(s_feat, t_feat)
-                    
-                    loss_non_key = loss_kd
-
-                else:
-                    # --- STANDARD COCO HUNGARIAN LOSS ---
-                    outputs_non_key = self.model.forward_non_key_frame(
-                        img_non_key, target_non_key
-                    )
-                    
-                    loss_dict_non_key = self.criterion(
-                        outputs_non_key, target_non_key, cached_indices=key_indices
-                    )
-                    weight_dict = self.criterion.weight_dict
-                    loss_non_key = sum(
-                        loss_dict_non_key[k] * weight_dict[k] 
-                        for k in loss_dict_non_key.keys() if k in weight_dict
+            else:
+                # For kd_only, decoder_only, and freeze_key
+                with torch.no_grad():
+                    outputs_key = self.model.forward_key_frame(img_key, target_key)
+                    _, key_indices = self.criterion(
+                        outputs_key, target_key, return_indices=True
                     )
 
-                loss_non_key_value = loss_non_key.item() if isinstance(loss_non_key, torch.Tensor) else loss_non_key
+            # 2. NON-KEY FRAME PATH (The Student)
+            if self.training_strategy == 'kd_only':
+                import torch.nn.functional as F
+
+                with torch.no_grad():
+                    teacher_backbone_feats = self.model.backbone(img_non_key)
+                    teacher_c3, teacher_c4, teacher_c5 = teacher_backbone_feats[-3:]
+                    teacher_ccff = self.model.encoder([teacher_c3, teacher_c4, teacher_c5])
                 
-                # 4. ACCUMULATE
-                if loss is None:
-                    loss = self.lambda_non_key * loss_non_key
-                else:
-                    loss = loss + self.lambda_non_key * loss_non_key
+                outputs_non_key, student_fused = self.model.forward_non_key_frame(
+                    img_non_key, target_non_key, return_fused=True
+                )
+                
+                loss_kd = 0.0
+                for s_feat, t_feat in zip(student_fused, teacher_ccff):
+                    loss_kd += F.mse_loss(s_feat, t_feat)
+                
+                loss_non_key = loss_kd
+
+            else:
+                # Standard Hungarian loss (decoder_only, freeze_key, and joint)
+                outputs_non_key = self.model.forward_non_key_frame(
+                    img_non_key, target_non_key
+                )
+                loss_dict_non_key = self.criterion(
+                    outputs_non_key, target_non_key, cached_indices=key_indices
+                )
+                weight_dict = self.criterion.weight_dict
+                loss_non_key = sum(
+                    loss_dict_non_key[k] * weight_dict[k] 
+                    for k in loss_dict_non_key.keys() if k in weight_dict
+                )
+
+            loss_non_key_value = loss_non_key.item() if isinstance(loss_non_key, torch.Tensor) else loss_non_key
             
-            if loss is not None:
-                loss.backward()
-                if self.clip_max_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        [p for p in self.model.parameters() if p.requires_grad], 
-                        max_norm=self.clip_max_norm
-                    )
-                self.optimizer.step()
+            # 3. ACCUMULATE & BACKPROP
+            if loss is None:
+                loss = loss_non_key
+            else:
+                loss = (1 - self.lambda_non_key) * loss + self.lambda_non_key * loss_non_key
             
-            # Accumulate losses
+            loss.backward()
+            if self.clip_max_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in self.model.parameters() if p.requires_grad], 
+                    max_norm=self.clip_max_norm
+                )
+            self.optimizer.step()
+            
             total_loss += loss.item() if loss is not None else 0.0
             total_loss_key += loss_key_value
             total_loss_non_key += loss_non_key_value
             
             # Logging
             if batch_idx % self.print_freq == 0:
-                if train_key and train_non_key:
+                if self.training_strategy == 'joint':
                     print(f"Epoch [{epoch+1}] Batch [{batch_idx}/{len(self.dataloader)}] "
-                        f"Loss: {loss.item():.4f} "
-                        f"(Key: {loss_key_value:.4f}, Non-Key: {loss_non_key_value:.4f})")
-                elif train_key:
-                    print(f"Epoch [{epoch+1}] Batch [{batch_idx}/{len(self.dataloader)}] "
-                        f"Loss: {loss.item():.4f} (Key only)")
+                          f"Loss: {loss.item():.4f} "
+                          f"(Key: {loss_key_value:.4f}, Non-Key: {loss_non_key_value:.4f})")
                 else:
                     print(f"Epoch [{epoch+1}] Batch [{batch_idx}/{len(self.dataloader)}] "
-                        f"Loss: {loss.item():.4f} (Non-Key only)")
+                          f"Loss: {loss.item():.4f} (Non-Key only)")
         
-        # Average losses
         avg_loss = total_loss / len(self.dataloader)
         avg_loss_key = total_loss_key / len(self.dataloader)
         avg_loss_non_key = total_loss_non_key / len(self.dataloader)
@@ -281,10 +203,9 @@ class Phase1Trainer:
             'loss': avg_loss,
             'loss_key': avg_loss_key,
             'loss_non_key': avg_loss_non_key,
-            'train_key': train_key,
-            'train_non_key': train_non_key,
+            'train_key': self.training_strategy == 'joint',
         }
-    
+        
     @torch.no_grad()
     def evaluate(self, val_dataloader: DataLoader, epoch: int) -> Dict[str, float]:
         """
@@ -293,10 +214,9 @@ class Phase1Trainer:
         """
         import gc
         self.model.eval()
-        if self.criterion is not None:
-            self.criterion.eval()
+        self.criterion.eval()
             
-        # Ensure dataset has COCO object (as we fixed in phase1_dataset.py)
+        # Ensure dataset has COCO object
         if not hasattr(val_dataloader.dataset, 'coco'):
             print("Error: Dataset missing .coco attribute. Cannot run COCO evaluation.")
             return {'mAP': 0.0}
@@ -321,16 +241,13 @@ class Phase1Trainer:
             res_key = self.postprocessor(outputs_key, orig_sizes_k)
             self._accumulate(results_key, target_key, res_key)
             # --- NON-KEY FRAME ---
-            has_non_key = (img_non_key is not None) and (len(img_non_key) > 0)
+            if isinstance(img_non_key, torch.Tensor):
+                img_non_key = img_non_key.to(self.device)
             
-            if has_non_key:
-                if isinstance(img_non_key, torch.Tensor):
-                    img_non_key = img_non_key.to(self.device)
-                
-                outputs_nk = self.model.forward_non_key_frame(img_non_key, None)
-                orig_sizes_nk = torch.stack([t["orig_size"] for t in target_non_key], dim=0).to(self.device)
-                res_nk = self.postprocessor(outputs_nk, orig_sizes_nk)
-                self._accumulate(results_non_key, target_non_key, res_nk)
+            outputs_nk = self.model.forward_non_key_frame(img_non_key, None)
+            orig_sizes_nk = torch.stack([t["orig_size"] for t in target_non_key], dim=0).to(self.device)
+            res_nk = self.postprocessor(outputs_nk, orig_sizes_nk)
+            self._accumulate(results_non_key, target_non_key, res_nk)
             
             if batch_idx % 100 == 0:
                 print(f"  Processed {batch_idx}/{len(val_dataloader)} batches")
@@ -340,11 +257,10 @@ class Phase1Trainer:
         k_stats = self._run_coco_eval(coco_gt, results_key)
         stats.update({f'key_{k}': v for k, v in k_stats.items()})
         
-        if results_non_key:
-            print("\n>>> NON-KEY FRAME RESULTS:")
-            nk_stats = self._run_coco_eval(coco_gt, results_non_key)
-            stats.update({f'non_key_{k}': v for k, v in nk_stats.items()})
-            print(f"Gap (Key - NonKey) mAP@50: {k_stats['mAP@50'] - nk_stats['mAP@50']:.4f}")
+        print("\n>>> NON-KEY FRAME RESULTS:")
+        nk_stats = self._run_coco_eval(coco_gt, results_non_key)
+        stats.update({f'non_key_{k}': v for k, v in nk_stats.items()})
+        print(f"Gap (Key - NonKey) mAP: {k_stats['mAP'] - nk_stats['mAP']:.4f}")
 
         del results_key
         del results_non_key
@@ -405,7 +321,12 @@ class Phase1Trainer:
             'metrics': metrics,
         }
         
-        checkpoint_path = self.output_dir / f'checkpoint_epoch_{epoch+1}.pth'
+        map5095 = metrics.get('non_key_mAP', 0.0)
+        map50 = metrics.get('non_key_mAP@50', 0.0)
+        
+        # Filename (e.g., checkpoint_epoch_10_050.pth)
+        checkpoint_path = self.output_dir / f'{epoch:02d}_{int(map5095 * 1000):03d}_{int(map50 * 1000):03d}.pth'
+        
         torch.save(checkpoint, checkpoint_path)
         print(f"Saved checkpoint to {checkpoint_path}")
         
@@ -413,15 +334,21 @@ class Phase1Trainer:
         latest_path = self.output_dir / 'checkpoint_latest.pth'
         torch.save(checkpoint, latest_path)
         
-        # Save best model based on total loss
+        # 4. Save best model based on highest Non-Key mAP
         best_path = self.output_dir / 'best_model.pth'
         if not best_path.exists():
             torch.save(checkpoint, best_path)
         else:
-            best_checkpoint = torch.load(best_path, weights_only=False)
-            if metrics['loss'] < best_checkpoint['metrics']['loss']:
+            try:
+                best_checkpoint = torch.load(best_path, weights_only=False)
+                best_map = best_checkpoint['metrics'].get('non_key_mAP', 0.0)
+                
+                if map5095 > best_map:
+                    torch.save(checkpoint, best_path)
+                    print(f"✓ New best model saved! (Non-Key mAP improved from {best_map:.4f} to {map5095:.4f})")
+            except Exception as e:
+                print(f"Warning: Could not read previous best_model.pth to compare mAP. Overwriting it. Error: {e}")
                 torch.save(checkpoint, best_path)
-                print(f"✓ New best model saved!")
 
 def build_model_from_config(config_path: str, device: torch.device):
     """
@@ -487,43 +414,21 @@ def load_pretrained_key_frame(model: TemporalRTDETR, pretrained_path: str, devic
     
     print(f"  Success!")
 
-
-class DebugSubsetDataLoader:
-    """Wrapper to limit dataloader to N batches for debugging"""
-    def __init__(self, dataloader, max_batches):
-        self.dataloader = dataloader
-        self.max_batches = max_batches
-        self.dataset = dataloader.dataset
-        self.collate_fn = dataloader.collate_fn
-        
-    def __iter__(self):
-        for i, batch in enumerate(self.dataloader):
-            if i >= self.max_batches:
-                break
-            yield batch
-    
-    def __len__(self):
-        return min(self.max_batches, len(self.dataloader))
-
-
 def main():
     parser = argparse.ArgumentParser()
     
     parser.add_argument('--config', '-c', type=str, required=True)
     parser.add_argument('--training_strategy', type=str, default='joint',
-                       choices=['alternate', 'freeze_key', 'joint'],
-                       help='alternate, freeze_key, or joint')
-    parser.add_argument('--alternate_interval', type=int, default=1,
-                       help='Alternate strategy only: switch every N epochs')
+                       choices=['freeze_key', 'joint', 'kd_only', 'decoder_only'],
+                       help='freeze_key, or joint')
     parser.add_argument('--pretrained', type=str, default=None,
                        help='Path to checkpoint (auto-detects key-only vs full temporal)')
     parser.add_argument('--eval_only', action='store_true',
                        help='Skip training and only run evaluation on the provided weights')
-    
-    # Debug mode
-    parser.add_argument('--debug', action='store_true')
-    parser.add_argument('--debug_batches', type=int, default=10,
-                       help='Number of batches to use in debug mode')
+    parser.add_argument('--same_frame', action='store_true',
+                       help='Diagnostic: Force non-key frame to be identical to key frame')
+    parser.add_argument('--init_weights', action='store_true', 
+                       help='Warm start: Copy pretrained key decoder weights to non-key decoder')
 
     # Optional
     parser.add_argument('--resume', '-r', type=str, default=None, 
@@ -534,14 +439,6 @@ def main():
                        help='Number of epochs (overrides config)')
     parser.add_argument('--output_dir', type=str, default=None, 
                        help='Output directory (overrides config)')
-    
-    parser.add_argument('--same_frame', action='store_true',
-                       help='Diagnostic: Force non-key frame to be identical to key frame')
-    parser.add_argument('--init_weights', action='store_true', 
-                       help='Warm start: Copy pretrained key decoder weights to non-key decoder')
-    parser.add_argument('--kd_only', action='store_true', 
-                       help='Only use KD loss (for Step 2 motion isolation)')
-    parser.add_argument('--freeze_fusion', action='store_true')
     
     args = parser.parse_args()
     
@@ -556,7 +453,8 @@ def main():
     # Load config and build model
     try:
         model, cfg = build_model_from_config(args.config, device)
-        # 1. FIRST: Load the pre-trained weights into the heavy model!
+
+        is_temporal = False
         if args.pretrained:
             print(f"\n=> Inspecting weights from: {args.pretrained}")
             checkpoint = torch.load(args.pretrained, map_location=device, weights_only=False)
@@ -571,13 +469,15 @@ def main():
                 model.load_state_dict(state_dict, strict=False)
             print("   Success!")
 
-        # 2. SECOND: Now that heavy model is smart, copy it to the lightweight layer!
         if args.init_weights:
-            print("\n=> Initializing Lightweight Decoder from Heavy Decoder...")
-            if hasattr(model, 'lightweight_decoder') and model.lightweight_decoder is not None:
-                heavy_last_layer_state = model.decoder.decoder.layers[-1].state_dict()
-                model.lightweight_decoder.decoder.layers[0].load_state_dict(heavy_last_layer_state)
-                print("   ✅ Successfully copied perfectly trained heavy transformer layer!")
+            if is_temporal:
+                print("\n=> [Skipping init_weights] Full temporal model detected. Preserving trained lightweight decoder weights.")
+            else:
+                print("\n=> Initializing Lightweight Decoder from Heavy Decoder...")
+                if hasattr(model, 'lightweight_decoder') and model.lightweight_decoder is not None:
+                    heavy_last_layer_state = model.decoder.decoder.layers[-1].state_dict()
+                    model.lightweight_decoder.decoder.layers[0].load_state_dict(heavy_last_layer_state)
+                    print("   ✅ Successfully copied perfectly trained heavy transformer layer!")
         
         # Get config values (with overrides)
         epochs = args.epochs if args.epochs is not None else getattr(cfg, 'epoches', 50)
@@ -592,20 +492,12 @@ def main():
         writer = SummaryWriter(log_dir=summary_dir)
         print(f"  Summary dir:      {summary_dir}")
         
-        # Debug mode overrides
-        if args.debug:
-            epochs = min(epochs, 3)
-            print_freq = 5
-            checkpoint_freq = 1
-        
         print(f"\nConfiguration:")
         print(f"  Epochs:           {epochs}")
         print(f"  Training strategy: {args.training_strategy}")
         print(f"  Lambda (non-key): {lambda_non_key}")
         print(f"  Output dir:       {output_dir}")
         print(f"  Seed:             {seed}")
-        if args.debug:
-            print(f"  Debug mode:      {args.debug_batches} batches/epoch")
         
         torch.manual_seed(seed)
         if torch.cuda.is_available():
@@ -621,12 +513,7 @@ def main():
     print(f"\nLoading dataset from config")
     try:
         train_dataloader = cfg.train_dataloader
-        if args.debug:
-            train_dataloader = DebugSubsetDataLoader(train_dataloader, args.debug_batches)
-            print(f"  DataLoader loaded (DEBUG MODE - {args.debug_batches} batches)")
-        else:
-            print(f"  DataLoader loaded")
-        
+        print(f"  DataLoader loaded")
         print(f"  Dataset: {train_dataloader.dataset.__class__.__name__}")
         print(f"  Collate function: {train_dataloader.collate_fn.__class__.__name__}")
         print(f"  Batches/epoch: {len(train_dataloader)}")
@@ -638,35 +525,38 @@ def main():
     
     # Get criterion from config
     criterion = cfg.criterion
-
     print("\n=> Preparing Temporal Model for Optimizer Registration...")
     
-    # The lightweight_decoder shares these with full decoder:
-    #   - input_proj, query_pos_head, dec_score_head, dec_bbox_head
-    # These shared heads MUST be trained via the key-frame path for the 
-    # non-key path to benefit from learned representations.
-    
     trainable_params = []
-    shared_head_names = {'dec_score_head', 'dec_bbox_head', 'input_proj', 'query_pos_head'}
     
     for name, param in model.named_parameters():
-        if args.kd_only:
-            # STRICT ISOLATION: Only fusion blocks get trained in KD mode
+        if args.training_strategy == 'kd_only':
+            # Train fusion blocks ONLY. 
             if 'fusion_blocks' in name:
                 param.requires_grad = True
                 trainable_params.append(param)
             else:
                 param.requires_grad = False
-        elif args.freeze_fusion:
-            # STAGE 2: Train lightweight decoder ONLY. Freeze the fusion blocks.
+                
+        elif args.training_strategy == 'decoder_only':
+            # Train lightweight transformer layers ONLY.
             if 'lightweight_decoder.decoder' in name:
                 param.requires_grad = True
                 trainable_params.append(param)
             else:
                 param.requires_grad = False
-        else:
-            # STANDARD MODE
+                
+        elif args.training_strategy == 'freeze_key':
+            # Train fusion blocks and lightweight decoder. Freeze heavy model.
             if 'fusion_blocks' in name or 'lightweight_decoder.decoder' in name:
+                param.requires_grad = True
+                trainable_params.append(param)
+            else:
+                param.requires_grad = False
+                
+        elif args.training_strategy == 'joint':
+            # Train heavy decoder, fusion blocks, and light decoder.
+            if 'decoder.' in name or 'fusion_blocks' in name or 'lightweight_decoder.decoder' in name:
                 param.requires_grad = True
                 trainable_params.append(param)
             else:
@@ -691,8 +581,6 @@ def main():
             sys.exit(1)
     
     val_dataloader = cfg.val_dataloader if hasattr(cfg, 'val_dataloader') else None
-    if args.debug:
-            val_dataloader = DebugSubsetDataLoader(val_dataloader, args.debug_batches)
     
     postprocessor = cfg.postprocessor
 
@@ -710,7 +598,6 @@ def main():
         print_freq=print_freq,
         clip_max_norm=clip_max_norm,
         training_strategy=args.training_strategy,
-        alternate_interval=args.alternate_interval,
         same_frame=args.same_frame
     )
     
@@ -722,13 +609,12 @@ def main():
             print("❌ Error: No validation dataloader found in config.")
             sys.exit(1)
             
-        # Run evaluation with a dummy epoch 0
         stats = trainer.evaluate(val_dataloader, epoch=0)
         
         print("\nFinal Evaluation Stats:")
         for k, v in stats.items():
             print(f"  {k}: {v:.4f}")
-        return  # Exit the main function gracefully
+        return
     
     # Training loop
     print("\n" + "="*80)
@@ -747,8 +633,7 @@ def main():
         print(f"  Total Loss:     {metrics['loss']:.4f}")
         if metrics['train_key']:
             print(f"  Key Frame:      {metrics['loss_key']:.4f}")
-        if metrics['train_non_key']:
-            print(f"  Non-Key Frame:  {metrics['loss_non_key']:.4f}")
+        print(f"  Non-Key Frame:  {metrics['loss_non_key']:.4f}")
         print(f"{'='*80}")
         
         if val_dataloader is not None:

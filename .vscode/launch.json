@@ -5,17 +5,18 @@
             "name": "Phase 1 Training (CPU)",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/rtdetrv2_pytorch/tools/phase1_training.py",
+            "program": "${workspaceFolder}/rtdetrv2_pytorch/tools/phase1_training_v2.py",
             "console": "integratedTerminal",
             "justMyCode": false,
             "python": "/home/robin/miniconda3/envs/rtdetr/bin/python",
             "args": [
                 "-c",
-                "rtdetrv2_pytorch/configs/rtdetrv2/phase1_virat_r18vd.yml",
+                "rtdetrv2_pytorch/configs/rtdetrv2/phase1_mot17_r18vd.yml",
                 "--pretrained",
-                "best.pth",
+                "best_mot17.pth",
                 "--training_strategy",
-                "joint"
+                "freeze_key",
+                "--init_weights"
             ],
             "cwd": "${workspaceFolder}",
             "env": {

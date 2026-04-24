@@ -1,6 +1,6 @@
 """
 Real-Time Temporal Inference Simulator
-Simulates a live K-NK-K-NK streaming environment with Batch Size = 1. 
+Simulates a live continuous streaming environment with configurable K-NK ratios.
 Tracks Latency, Peak VRAM Memory Allocation, and Combined COCO mAP.
 """
 
@@ -43,6 +43,12 @@ def evaluate_map(coco_gt, results, title):
         return 0.0
     coco_dt = coco_gt.loadRes(results)
     evaluator = COCOeval(coco_gt, coco_dt, 'bbox')
+    
+    # STRICTLY LIMIT EVALUATION TO THE IMAGES PREDICTED
+    # Prevents artificial deflation when evaluating partial streams
+    predicted_img_ids = sorted(list(set([res['image_id'] for res in results])))
+    evaluator.params.imgIds = predicted_img_ids
+    
     evaluator.evaluate()
     evaluator.accumulate()
     evaluator.summarize()
@@ -53,6 +59,8 @@ def main():
     parser.add_argument('-c', '--config', type=str, required=True, help='Path to config yml')
     parser.add_argument('-w', '--weights', type=str, required=True, help='Path to checkpoint .pth file')
     parser.add_argument('--warmup', type=int, default=10, help='Ignore first N batches for timing/memory')
+    parser.add_argument('--nk_per_key', type=int, default=1, 
+                        help='Number of Non-Key frames per Key frame. 1 = (K, NK), 2 = (K, NK, NK), etc.')
     args = parser.parse_args()
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -68,11 +76,6 @@ def main():
             cfg.yaml_cfg['val_dataloader']['batch_size'] = 1
         if 'drop_last' in cfg.yaml_cfg['val_dataloader']:
             cfg.yaml_cfg['val_dataloader']['drop_last'] = False
-        
-        # Also enforce in the dataset wrapper if it exists there
-        if 'dataset' in cfg.yaml_cfg['val_dataloader'] and hasattr(cfg, 'val_dataloader'):
-            pass # Dictionary update is sufficient for YAMLConfig instantiation
-    # ---------------------------------------------------------
     
     # 2. Build Model Architecture
     base_model = cfg.model.to(device)
@@ -104,55 +107,77 @@ def main():
     model.load_state_dict(checkpoint.get('model_state_dict', checkpoint.get('model', checkpoint)), strict=True)
     model.eval()
     
-    # Because we modified cfg.yaml_cfg above, this will build a dataloader with batch_size=1
-    val_dataloader = cfg.val_dataloader
+    # --- PHYSICAL DATALOADER REBUILD FOR BATCH_SIZE=1 ---
+    base_val_loader = cfg.val_dataloader
+    from torch.utils.data import DataLoader
+    
+    print("Rebuilding validation dataloader to force batch_size=1...")
+    val_dataloader = DataLoader(
+        dataset=base_val_loader.dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=base_val_loader.num_workers,
+        collate_fn=base_val_loader.collate_fn,
+        drop_last=False
+    )
+    # -----------------------------------------------------
     coco_gt = val_dataloader.dataset.coco
     postprocessor = cfg.postprocessor
     
-    # Separate lists for Key and Non-Key frames
     res_key = []
     res_nk = []
     
-    # Tracking Metrics
     metrics = {
         'k_time': 0.0, 'k_mem': 0.0, 'k_frames': 0,
         'nk_time': 0.0, 'nk_mem': 0.0, 'nk_frames': 0
     }
 
-    print("\n--- INITIATING REAL-TIME STREAM SIMULATION ---")
+    # The length of one full cycle (e.g., K-NK-NK has a cycle length of 3)
+    cycle_len = args.nk_per_key + 1
+
+    print(f"\n--- INITIATING REAL-TIME STREAM SIMULATION (1 Key : {args.nk_per_key} Non-Key) ---")
     with torch.no_grad():
         for i, batch in enumerate(tqdm(val_dataloader, desc="Streaming Video")):
             img_key, target_key, img_non_key, target_non_key = batch
             
+            # Determine where we are in the K-NK cycle
+            step = i % cycle_len
+            
+            if step == args.nk_per_key:
+                # SKIP BATCH: The img_non_key in this batch is the next cycle's Key frame.
+                # If we evaluate it here, we double-count it.
+                continue
+            
             # ==========================================
-            # STEP 1: KEY FRAME ARRIVES (Heavy Inference)
+            # KEY FRAME ARRIVES (Only on step 0)
             # ==========================================
-            img_key = img_key.to(device)
-            
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-                torch.cuda.reset_peak_memory_stats()
-            
-            t0 = time.perf_counter()
-            
-            # Forward pass inherently updates the temporal memory cache
-            out_k = model.forward_key_frame(img_key, None)
-            
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            t1 = time.perf_counter()
-            
-            if i >= args.warmup:
-                metrics['k_time'] += (t1 - t0)
-                metrics['k_frames'] += 1
-                if torch.cuda.is_available():
-                    metrics['k_mem'] += torch.cuda.max_memory_allocated() / (1024 ** 2)
+            if step == 0:
+                img_key = img_key.to(device)
                 
-            orig_sizes_k = torch.stack([t["orig_size"] for t in target_key], dim=0).to(device)
-            format_coco(target_key, postprocessor(out_k, orig_sizes_k), res_key)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.reset_peak_memory_stats()
+                
+                t0 = time.perf_counter()
+                
+                # Forward pass natively caches the features for upcoming Non-Key frames
+                out_k = model.forward_key_frame(img_key, None)
+                
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                t1 = time.perf_counter()
+                
+                if i >= args.warmup:
+                    metrics['k_time'] += (t1 - t0)
+                    metrics['k_frames'] += 1
+                    if torch.cuda.is_available():
+                        metrics['k_mem'] += torch.cuda.max_memory_allocated() / (1024 ** 2)
+                
+                orig_sizes_k = torch.stack([t["orig_size"] for t in target_key], dim=0).to(device)
+                format_coco(target_key, postprocessor(out_k, orig_sizes_k), res_key)
             
             # ==========================================
-            # STEP 2: NON-KEY FRAME ARRIVES (Light Inference)
+            # NON-KEY FRAME ARRIVES (Every step except the skipped one)
             # ==========================================
             if img_non_key is not None and len(img_non_key) > 0:
                 img_non_key = img_non_key.to(device)
@@ -163,7 +188,7 @@ def main():
                 
                 t2 = time.perf_counter()
                 
-                # Explicitly grabs the cache from the Key pass and computes the shortcut
+                # Relies on the cache stored during step == 0
                 out_nk = model.forward_non_key_frame(img_non_key, None)
                 
                 if torch.cuda.is_available():
@@ -175,11 +200,11 @@ def main():
                     metrics['nk_frames'] += 1
                     if torch.cuda.is_available():
                         metrics['nk_mem'] += torch.cuda.max_memory_allocated() / (1024 ** 2)
-                    
+                
                 orig_sizes_nk = torch.stack([t["orig_size"] for t in target_non_key], dim=0).to(device)
                 format_coco(target_non_key, postprocessor(out_nk, orig_sizes_nk), res_nk)
 
-    # Combine results for overall evaluation
+    # Combine results
     results_combined = res_key + res_nk
 
     # Calculate Averages
@@ -193,13 +218,12 @@ def main():
     print("REAL-TIME PERFORMANCE REPORT")
     print("="*60)
     
-    # Evaluate individual and combined mAPs
     map_k = evaluate_map(coco_gt, res_key, "HEAVY KEY MODEL ONLY")
     map_nk = evaluate_map(coco_gt, res_nk, "LIGHTWEIGHT NON-KEY MODEL ONLY")
     combined_map = evaluate_map(coco_gt, results_combined, "COMBINED OVERALL AVERAGE")
     
     print("\n" + "="*60)
-    print("FINAL SUMMARY (Averaged per Frame):")
+    print(f"FINAL SUMMARY (Averaged per Frame - Level {args.nk_per_key}):")
     print("="*60)
     print(f"  Combined System Accuracy (mAP):  {combined_map:.4f}\n")
     
