@@ -1,5 +1,5 @@
 __include__:  [
-  '../dataset/visdrone_vid_detection.yml',
+  '../dataset/visdrone_detection.yml',
   '../runtime.yml',
   './include/dataloader.yml',
   './include/optimizer.yml',
@@ -7,49 +7,51 @@ __include__:  [
 ]
 
 tuning:  ./rtdetrv2_r18vd_120e_coco.pth
-
 output_dir: ./output/rtdetrv2_r18vd_visdrone
 
-num_classes: 11
+num_classes: 2
 
-PResNet:  
+# ResNet-18 backbone
+PResNet: 
   depth: 18
+  freeze_at: 4
+  freeze_norm: True
+  pretrained: False
 
 HybridEncoder:
   in_channels: [128, 256, 512]
   hidden_dim: 256
-  expansion:  0.5
+  expansion: 0.5
+  dropout: 0.1
 
 RTDETRTransformerv2:
   num_layers: 3
 
 epoches: 10
+use_focal_loss: True
 
-optimizer: 
+optimizer:
   type: AdamW
-  params: 
+  params:
     - 
-      params: '^(?=.*backbone\.layer[234])(?!.*(?:norm|bn)).*$'
+      params: '^(?=.*backbone)(?!.*norm|bn).*$'
       lr: 0.000005
     - 
-      params:  '^(?=.*backbone)(?=.*(?:norm|bn)).*$'
+      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn)).*$'
       weight_decay: 0.
-    - 
-      params:  '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn)).*$'
-      weight_decay: 0.
-  
   lr: 0.00005
   betas: [0.9, 0.999]
-  weight_decay: 0.0001
+  weight_decay: 0.001
 
-lr_scheduler:
+# ⭐ Gentler LR schedule
+LRScheduler:
   type: MultiStepLR
   milestones: [40, 50]
   gamma: 0.1
 
-lr_warmup_scheduler:  
+LRWarmup:
   type: LinearWarmup
-  warmup_duration: 5        # Longer warmup
+  warmup_duration: 5
 
 train_dataloader: 
   total_batch_size: 16
