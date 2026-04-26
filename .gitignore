@@ -177,3 +177,6 @@ rtdetrv2_pytorch/dataset/
 
 # Ignore all training outputs
 output/
+
+AGENTS.md
+

@@ -167,7 +167,7 @@ class TemporalRTDETR(nn.Module):
         hidden_dim: int = 256,
         num_queries: int = 300,
         use_lightweight_decoder: bool = True,
-        reuse_queries: bool = True,
+        reuse_position: int = 0,
     ):
         super().__init__()
         
@@ -178,7 +178,15 @@ class TemporalRTDETR(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_queries = num_queries
         self.use_lightweight_decoder = use_lightweight_decoder
-        self.reuse_queries = reuse_queries
+        self.reuse_position = int(reuse_position)
+        self.decoder_num_layers = getattr(getattr(decoder, 'decoder', None), 'num_layers', None)
+        if self.reuse_position < 0:
+            raise ValueError(f"reuse_position must be >= 0, but got {self.reuse_position}")
+        if self.decoder_num_layers is not None and self.reuse_position > self.decoder_num_layers:
+            raise ValueError(
+                f"reuse_position must be in [0, {self.decoder_num_layers}] for this decoder, "
+                f"but got {self.reuse_position}"
+            )
         
         # Cached features from key frame
         self.cached_ccff = None
@@ -204,7 +212,7 @@ class TemporalRTDETR(nn.Module):
         
         print(f"  Success!")
         print(f"  - Use lightweight decoder: {use_lightweight_decoder}")
-        print(f"  - Reuse queries: {reuse_queries}")
+        print(f"  - Reuse position: {self.reuse_position}")
     
     def forward_key_frame(self, img: torch.Tensor, targets: Optional[List[Dict]] = None) -> Tuple:
         """
@@ -223,12 +231,17 @@ class TemporalRTDETR(nn.Module):
         c3, c4, c5 = backbone_features[-3:]
         encoder_output = self.encoder([c3, c4, c5])
         self.cached_ccff = [feat.detach() for feat in encoder_output]
-        outputs, cached_query = self.decoder(encoder_output, return_query=True, targets=targets)
-        
-        if self.reuse_queries:
-            # self.cached_queries = outputs['query_embed'].detach()
-            self.cached_content = cached_query[0][:, :self.num_queries, :].detach()
-            self.cached_points_unact = cached_query[1][:, :self.num_queries, :].detach()
+        outputs, cached_query_states = self.decoder(encoder_output, return_query=True, targets=targets)
+
+        if self.reuse_position >= len(cached_query_states):
+            raise ValueError(
+                f"reuse_position={self.reuse_position} is out of range for available positions "
+                f"[0, {len(cached_query_states) - 1}]"
+            )
+
+        cached_content, cached_points_unact = cached_query_states[self.reuse_position]
+        self.cached_content = cached_content[:, :self.num_queries, :].detach()
+        self.cached_points_unact = cached_points_unact[:, :self.num_queries, :].detach()
         
         return outputs
     
@@ -245,6 +258,8 @@ class TemporalRTDETR(nn.Module):
         """
         if self.cached_ccff is None:
             raise RuntimeError("Key frame must be processed first to cache CCFF features")
+        if self.cached_content is None or self.cached_points_unact is None:
+            raise RuntimeError("Key frame must cache decoder queries before non-key inference")
         
         # Extract multi-scale features from backbone
         backbone_features = self.backbone(img)
@@ -261,9 +276,6 @@ class TemporalRTDETR(nn.Module):
         
         # Prepare decoder input (fused multi-scale features)
         decoder_input = fused_features
-        
-        # Get cached query embeddings if available
-        # query_embed = self.cached_content if self.reuse_queries else None
         
         # Use lightweight or full decoder
         if self.use_lightweight_decoder and self.lightweight_decoder is not None:
@@ -321,7 +333,7 @@ def build_temporal_rtdetr(cfg):
         hidden_dim=cfg.hidden_dim,
         num_queries=cfg.num_queries,
         use_lightweight_decoder=cfg.get('use_lightweight_decoder', True),
-        reuse_queries=cfg.get('reuse_queries', True),
+        reuse_position=cfg.get('reuse_position', 0),
     )
     
     return model

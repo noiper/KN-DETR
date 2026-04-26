@@ -36,7 +36,7 @@ lambda_non_key: 0.5      # Loss weight for non-key frames: L = L_key + λ*L_non_
 
 # Non-key frame decoder configuration
 use_lightweight_decoder: True  # True: 1-layer decoder, False: 3-layer decoder (full)
-reuse_queries: True            # True: reuse queries from key frame (experimental)
+reuse_position: 0             # Reuse query state from key decoder position (0=before decoder, 1..L=after layer)
 non_key_decoder_layers: 1       # Number of layers for non-key decoder (1 or 3)
 
 # Training Settings

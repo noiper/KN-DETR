@@ -252,10 +252,19 @@ class TransformerDecoder(nn.Module):
                 score_head,
                 query_pos_head,
                 attn_mask=None,
-                memory_mask=None):
+                memory_mask=None,
+                return_intermediate_queries=False,
+                query_start_idx=0):
         dec_out_bboxes = []
         dec_out_logits = []
         ref_points_detach = F.sigmoid(ref_points_unact)
+        query_states = []
+
+        if return_intermediate_queries:
+            query_states.append((
+                target[:, query_start_idx:, :],
+                ref_points_unact[:, query_start_idx:, :],
+            ))
 
         output = target
         for i, layer in enumerate(self.layers):
@@ -264,7 +273,14 @@ class TransformerDecoder(nn.Module):
 
             output = layer(output, ref_points_input, memory, memory_spatial_shapes, attn_mask, memory_mask, query_pos_embed)
 
-            inter_ref_bbox = F.sigmoid(bbox_head[i](output) + inverse_sigmoid(ref_points_detach))
+            inter_ref_bbox_unact = bbox_head[i](output) + inverse_sigmoid(ref_points_detach)
+            inter_ref_bbox = F.sigmoid(inter_ref_bbox_unact)
+
+            if return_intermediate_queries:
+                query_states.append((
+                    output[:, query_start_idx:, :],
+                    inter_ref_bbox_unact[:, query_start_idx:, :].detach(),
+                ))
 
             if self.training:
                 dec_out_logits.append(score_head[i](output))
@@ -281,6 +297,8 @@ class TransformerDecoder(nn.Module):
             ref_points = inter_ref_bbox
             ref_points_detach = inter_ref_bbox.detach()
 
+        if return_intermediate_queries:
+            return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), query_states
         return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits)
 
 
@@ -572,11 +590,10 @@ class RTDETRTransformerv2(nn.Module):
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
         cached_query = None
-        if return_query:
-            cached_query = init_ref_contents, init_ref_points_unact
+        query_start_idx = denoising_bbox_unact.shape[1] if denoising_bbox_unact is not None else 0
 
         # decoder
-        out_bboxes, out_logits = self.decoder(
+        decoder_outputs = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
             memory,
@@ -584,7 +601,14 @@ class RTDETRTransformerv2(nn.Module):
             self.dec_bbox_head,
             self.dec_score_head,
             self.query_pos_head,
-            attn_mask=attn_mask)
+            attn_mask=attn_mask,
+            return_intermediate_queries=return_query,
+            query_start_idx=query_start_idx)
+
+        if return_query:
+            out_bboxes, out_logits, cached_query = decoder_outputs
+        else:
+            out_bboxes, out_logits = decoder_outputs
 
         if self.training and dn_meta is not None:
             dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)

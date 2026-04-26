@@ -38,7 +38,7 @@ def build_model_from_config(config_path: str, device: torch.device):
         num_queries = decoder_cfg.get('num_queries', 300)
     
     use_lightweight_decoder = cfg.yaml_cfg.get('use_lightweight_decoder', False)
-    reuse_queries = cfg.yaml_cfg.get('reuse_queries', False)
+    reuse_position = cfg.yaml_cfg.get('reuse_position', 0)
     
     temporal_model = TemporalRTDETR(
         backbone=backbone,
@@ -48,7 +48,7 @@ def build_model_from_config(config_path: str, device: torch.device):
         hidden_dim=hidden_dim,
         num_queries=num_queries,
         use_lightweight_decoder=use_lightweight_decoder,
-        reuse_queries=reuse_queries,
+        reuse_position=reuse_position,
     )
     
     return temporal_model, cfg

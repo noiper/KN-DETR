@@ -459,7 +459,7 @@ def build_model_from_config(config_path: str, device: torch.device):
     
     # Get Phase 1 specific parameters
     use_lightweight_decoder = cfg.yaml_cfg.get('use_lightweight_decoder', False)
-    reuse_queries = cfg.yaml_cfg.get('reuse_queries', False)
+    reuse_position = cfg.yaml_cfg.get('reuse_position', 0)
     
     # Create temporal model
     temporal_model = TemporalRTDETR(
@@ -470,7 +470,7 @@ def build_model_from_config(config_path: str, device: torch.device):
         hidden_dim=hidden_dim,
         num_queries=num_queries,
         use_lightweight_decoder=use_lightweight_decoder,
-        reuse_queries=reuse_queries,
+        reuse_position=reuse_position,
     )
     
     return temporal_model, cfg
