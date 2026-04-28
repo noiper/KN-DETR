@@ -13,7 +13,7 @@ train_dataloader:
     type: ViratTemporalDataset
     root_dir: ../dataset/VIRAT/train_videos/
     ann_file: ../dataset/VIRAT/train.json
-    max_frame_gap: 1
+    max_frame_gap: 3
     pair_sampling_strategy: "all"
     frame_stride: 1
     transforms:
@@ -49,10 +49,8 @@ val_dataloader:
     root_dir: ../dataset/VIRAT/val_videos/
     ann_file: ../dataset/VIRAT/val.json
     max_frame_gap: 1
-    # pair_sampling_strategy: "random_single"
-    # frame_stride: 1
     pair_sampling_strategy: "fixed_gap"
-    frame_stride: 2
+    frame_stride: 4
     transforms:
       type: Compose
       ops: 

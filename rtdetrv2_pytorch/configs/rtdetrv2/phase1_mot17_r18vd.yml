@@ -7,8 +7,8 @@ __include__: [
 ]
 
 # Override output directory
-output_dir: './output/phase1_mot17_r18vd_test'
-summary_dir: './output/phase1_mot17_r18vd_test/summary'
+output_dir: './output/phase1_mot17_level1'
+summary_dir: './output/phase1_mot17_level1/summary'
 
 # Override to ResNet18
 PResNet:
@@ -36,11 +36,11 @@ lambda_non_key: 0.5      # Loss weight for non-key frames: L = L_key + λ*L_non_
 
 # Non-key frame decoder configuration
 use_lightweight_decoder: True  # True: 1-layer decoder, False: 3-layer decoder (full)
-reuse_position: 0             # Reuse query state from key decoder position (0=before decoder, 1..L=after layer)
+reuse_position: 3             # Reuse query state from key decoder position (0=before decoder, 1..L=after layer)
 non_key_decoder_layers: 1       # Number of layers for non-key decoder (1 or 3)
 
 # Training Settings
-epoches: 5
+epoches: 30
 clip_max_norm: 0.1
 
 # Learning Rate Scheduler (override)
@@ -50,7 +50,7 @@ lr_scheduler:
   gamma: 0.1
 
 # Logging and Checkpointing
-print_freq: 100
+print_freq: 50
 checkpoint_freq: 1
 
 # Random seed
