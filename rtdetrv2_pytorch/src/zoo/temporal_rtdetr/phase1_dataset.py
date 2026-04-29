@@ -297,6 +297,35 @@ class ViratTemporalDataset(Dataset):
     
     def __len__(self) -> int:
         return len(self.samples)
+
+    def _apply_shared_pair_transforms(
+        self,
+        img_key,
+        target_key,
+        img_non_key,
+        target_non_key,
+    ):
+        # Reuse identical RNG states so key/non-key sample identical transform params.
+        torch_state = torch.get_rng_state()
+        py_state = random.getstate()
+        np_state = np.random.get_state()
+        global_samples = getattr(self.transforms, 'global_samples', None)
+
+        transformed_key = self.transforms(img_key, target_key, self)
+        img_key, target_key = transformed_key[:2]
+
+        torch.set_rng_state(torch_state)
+        random.setstate(py_state)
+        np.random.set_state(np_state)
+        if global_samples is not None and hasattr(self.transforms, 'global_samples'):
+            self.transforms.global_samples = global_samples
+
+        transformed_non_key = self.transforms(img_non_key, target_non_key, self)
+        img_non_key, target_non_key = transformed_non_key[:2]
+        if global_samples is not None and hasattr(self.transforms, 'global_samples'):
+            self.transforms.global_samples = global_samples + 1
+
+        return img_key, target_key, img_non_key, target_non_key
     
     def __getitem__(self, idx: int):
         """Returns: tuple of (image_key, target_key, image_non_key, target_non_key)"""
@@ -309,8 +338,12 @@ class ViratTemporalDataset(Dataset):
         
         # Apply transforms
         if self.transforms is not None:
-            img_key, target_key, _ = self.transforms(img_key, target_key, self)
-            img_non_key, target_non_key, _ = self.transforms(img_non_key, target_non_key, self)
+            img_key, target_key, img_non_key, target_non_key = self._apply_shared_pair_transforms(
+                img_key,
+                target_key,
+                img_non_key,
+                target_non_key,
+            )
         else:
             # Apply default transform
             img_key, target_key = self._apply_default_transform(img_key, target_key)

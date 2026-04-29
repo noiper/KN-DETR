@@ -159,11 +159,8 @@ class Phase1Trainer:
                 loss_dict_non_key = self.criterion(
                     outputs_non_key, target_non_key, cached_indices=key_indices
                 )
-                weight_dict = self.criterion.weight_dict
-                loss_non_key = sum(
-                    loss_dict_non_key[k] * weight_dict[k] 
-                    for k in loss_dict_non_key.keys() if k in weight_dict
-                )
+                # RTDETRCriterionv2 already applies weight_dict internally.
+                loss_non_key = sum(loss_dict_non_key.values())
 
             loss_non_key_value = loss_non_key.item() if isinstance(loss_non_key, torch.Tensor) else loss_non_key
             
@@ -418,13 +415,15 @@ def main():
     parser = argparse.ArgumentParser()
     
     parser.add_argument('--config', '-c', type=str, required=True)
-    parser.add_argument('--training_strategy', type=str, default='joint',
+    parser.add_argument('--training_strategy', type=str, default='freeze_key',
                        choices=['freeze_key', 'joint', 'kd_only', 'decoder_only'],
                        help='freeze_key, or joint')
     parser.add_argument('--pretrained', type=str, default=None,
                        help='Path to checkpoint (auto-detects key-only vs full temporal)')
     parser.add_argument('--eval_only', action='store_true',
                        help='Skip training and only run evaluation on the provided weights')
+    parser.add_argument('--eval_before_train', action='store_true',
+                       help='Run one validation pass before the first training epoch')
     parser.add_argument('--same_frame', action='store_true',
                        help='Diagnostic: Force non-key frame to be identical to key frame')
     parser.add_argument('--init_weights', action='store_true', 
@@ -615,6 +614,20 @@ def main():
         for k, v in stats.items():
             print(f"  {k}: {v:.4f}")
         return
+
+    if args.eval_before_train:
+        print("\n" + "="*80)
+        print("Executing PRE-TRAINING EVALUATION...")
+        print("="*80)
+        if val_dataloader is None:
+            print("⚠️ Warning: No validation dataloader found in config. Skipping pre-training evaluation.")
+        else:
+            pretrain_stats = trainer.evaluate(val_dataloader, epoch=start_epoch)
+            print("\nPre-Training Evaluation Stats:")
+            for k, v in pretrain_stats.items():
+                print(f"  {k}: {v:.4f}")
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    writer.add_scalar(f"PreTrainEval/{k}", v, start_epoch)
     
     # Training loop
     print("\n" + "="*80)

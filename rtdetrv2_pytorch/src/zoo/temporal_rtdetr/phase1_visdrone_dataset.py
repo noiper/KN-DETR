@@ -2,6 +2,7 @@ import os
 import copy
 import random
 from collections import defaultdict
+import numpy as np
 import torch
 from torchvision.datasets import CocoDetection
 from torchvision import datapoints
@@ -128,6 +129,27 @@ class VisDroneTemporalDataset(CocoDetection):
             
         return img, res_target
 
+    def _apply_shared_pair_transforms(self, img_k, target_k, img_nk, target_nk):
+        # Reuse identical RNG states so key/non-key sample identical transform params.
+        torch_state = torch.get_rng_state()
+        py_state = random.getstate()
+        np_state = np.random.get_state()
+        global_samples = getattr(self.prepare, 'global_samples', None)
+
+        img_k, target_k = self.prepare(img_k, target_k)
+
+        torch.set_rng_state(torch_state)
+        random.setstate(py_state)
+        np.random.set_state(np_state)
+        if global_samples is not None and hasattr(self.prepare, 'global_samples'):
+            self.prepare.global_samples = global_samples
+
+        img_nk, target_nk = self.prepare(img_nk, target_nk)
+        if global_samples is not None and hasattr(self.prepare, 'global_samples'):
+            self.prepare.global_samples = global_samples + 1
+
+        return img_k, target_k, img_nk, target_nk
+
     def __getitem__(self, idx):
         """Returns the Key and Non-Key tuple ready for the temporal network"""
         key_id, non_key_id = self.pairs[idx]
@@ -138,8 +160,12 @@ class VisDroneTemporalDataset(CocoDetection):
         
         # 2. Apply transforms EXACTLY ONCE
         if self._transforms is not None:
-            img_k, target_k = self.prepare(img_k, target_k)
-            img_nk, target_nk = self.prepare(img_nk, target_nk)
+            img_k, target_k, img_nk, target_nk = self._apply_shared_pair_transforms(
+                img_k,
+                target_k,
+                img_nk,
+                target_nk,
+            )
             
         return img_k, target_k, img_nk, target_nk
 
