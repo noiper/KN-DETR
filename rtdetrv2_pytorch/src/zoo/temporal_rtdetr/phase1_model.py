@@ -66,7 +66,12 @@ class LightweightDecoder(RTDETRTransformerv2):
     - No denoising
     - No aux_loss
     """
-    def __init__(self, full_decoder: RTDETRTransformerv2, num_layers: int = 1):
+    def __init__(
+        self,
+        full_decoder: RTDETRTransformerv2,
+        num_layers: int = 1,
+        decouple_prediction_heads: bool = False,
+    ):
         nn.Module.__init__(self)
         
         # self.hidden_dim = full_decoder.hidden_dim       
@@ -84,17 +89,40 @@ class LightweightDecoder(RTDETRTransformerv2):
 
         # Share by direct memory reference.
         self.input_proj = full_decoder.input_proj
-        self.query_pos_head = full_decoder.query_pos_head
-
-        # Slice the ModuleList to grab only the LAST `num_layers` heads
-        self.dec_score_head = nn.ModuleList(
-            list(full_decoder.dec_score_head[-self.num_decoder_layers:])
-        )
-        self.dec_bbox_head = nn.ModuleList(
-            list(full_decoder.dec_bbox_head[-self.num_decoder_layers:])
+        self._set_prediction_modules(
+            full_decoder=full_decoder,
+            decouple_prediction_heads=decouple_prediction_heads,
         )
         
         self.eval_spatial_size = full_decoder.eval_spatial_size
+
+    def _set_prediction_modules(self, full_decoder: RTDETRTransformerv2, decouple_prediction_heads: bool):
+        if decouple_prediction_heads:
+            self.query_pos_head = copy.deepcopy(full_decoder.query_pos_head)
+            self.dec_score_head = nn.ModuleList(
+                [copy.deepcopy(head) for head in list(full_decoder.dec_score_head[-self.num_decoder_layers:])]
+            )
+            self.dec_bbox_head = nn.ModuleList(
+                [copy.deepcopy(head) for head in list(full_decoder.dec_bbox_head[-self.num_decoder_layers:])]
+            )
+        else:
+            self.query_pos_head = full_decoder.query_pos_head
+            # Slice the ModuleList to grab only the LAST `num_layers` heads
+            self.dec_score_head = nn.ModuleList(
+                list(full_decoder.dec_score_head[-self.num_decoder_layers:])
+            )
+            self.dec_bbox_head = nn.ModuleList(
+                list(full_decoder.dec_bbox_head[-self.num_decoder_layers:])
+            )
+        self.decoupled_prediction_heads = decouple_prediction_heads
+
+    def decouple_prediction_modules(self):
+        if self.decoupled_prediction_heads:
+            return
+        self.query_pos_head = copy.deepcopy(self.query_pos_head)
+        self.dec_score_head = nn.ModuleList([copy.deepcopy(head) for head in self.dec_score_head])
+        self.dec_bbox_head = nn.ModuleList([copy.deepcopy(head) for head in self.dec_bbox_head])
+        self.decoupled_prediction_heads = True
     
     def _get_encoder_input(self, feats: List[torch.Tensor]):
         # get projection features
@@ -312,6 +340,11 @@ class TemporalRTDETR(nn.Module):
         non_key_outputs = self.forward_non_key_frame(non_key_frame, non_key_targets)
         
         return key_outputs, non_key_outputs
+
+    def decouple_non_key_prediction_heads(self):
+        if not self.use_lightweight_decoder or self.lightweight_decoder is None:
+            raise RuntimeError("Lightweight decoder is required to decouple non-key prediction modules")
+        self.lightweight_decoder.decouple_prediction_modules()
 
 
 def build_temporal_rtdetr(cfg):

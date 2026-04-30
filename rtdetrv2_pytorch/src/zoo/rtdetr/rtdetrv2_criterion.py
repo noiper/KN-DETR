@@ -146,10 +146,11 @@ class RTDETRCriterionv2(nn.Module):
         outputs_without_aux = {k: v for k, v in outputs.items() if 'aux' not in k}
 
         if cached_indices is None:
-            # Standard DETR: Run the matcher to find the best assignment
-            indices = self.matcher(outputs_without_aux, targets)
+            # Standard DETR: Run the matcher to find the best assignment.
+            matched = self.matcher(outputs_without_aux, targets)
+            indices = matched['indices']
         else:
-            # Temporal DETR: Force the model to use the key frame's assignment!
+            # Temporal DETR: Force the model to use the key frame's assignment.
             indices = cached_indices
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
@@ -159,10 +160,6 @@ class RTDETRCriterionv2(nn.Module):
             torch.distributed.all_reduce(num_boxes)
         num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
         
-        # Retrieve the matching between the outputs of the last layer and the targets
-        matched = self.matcher(outputs_without_aux, targets)
-        indices = matched['indices']
-
         # Compute all the requested losses
         losses = {}
         for loss in self.losses:

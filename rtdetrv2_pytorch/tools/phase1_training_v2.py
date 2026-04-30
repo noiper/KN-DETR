@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import argparse
-from typing import Dict
+from typing import Dict, List, Tuple
 
 from src.core._config import BaseConfig
 
@@ -51,6 +51,7 @@ class Phase1Trainer:
         clip_max_norm: float = 0.1,
         training_strategy: str = 'joint',
         same_frame: bool = False,
+        reuse_match_indices: bool = False,
     ):
         self.model = model
         self.criterion = criterion
@@ -66,6 +67,7 @@ class Phase1Trainer:
         self.clip_max_norm = clip_max_norm
         self.training_strategy = training_strategy
         self.same_frame = same_frame
+        self.reuse_match_indices = reuse_match_indices
         
         valid_strategies = ['kd_only', 'decoder_only', 'freeze_key', 'joint']
         if self.training_strategy not in valid_strategies:
@@ -77,6 +79,26 @@ class Phase1Trainer:
         print(f"\nTraining Strategy: {self.training_strategy}")
         if self.same_frame:
             print("--same_frame is active.")
+
+    def _sanitize_cached_indices(
+        self,
+        cached_indices: List[Tuple[torch.Tensor, torch.Tensor]],
+        targets: List[Dict],
+        num_queries: int,
+    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        sanitized = []
+        for (src_idx, tgt_idx), target in zip(cached_indices, targets):
+            src_idx = src_idx.to(self.device, dtype=torch.int64)
+            tgt_idx = tgt_idx.to(self.device, dtype=torch.int64)
+            max_tgt = target['labels'].shape[0]
+            valid = (
+                (src_idx >= 0)
+                & (src_idx < num_queries)
+                & (tgt_idx >= 0)
+                & (tgt_idx < max_tgt)
+            )
+            sanitized.append((src_idx[valid], tgt_idx[valid]))
+        return sanitized
 
     def train_one_epoch(self, epoch: int) -> Dict[str, float]:
         """
@@ -90,6 +112,7 @@ class Phase1Trainer:
         
         for batch_idx, batch in enumerate(self.dataloader):
             img_key, target_key, img_non_key, target_non_key = batch
+            key_indices = None
 
             if self.same_frame:
                 img_non_key = img_key.clone()
@@ -113,9 +136,12 @@ class Phase1Trainer:
             # 1. KEY FRAME PATH (The Teacher)
             if self.training_strategy == 'joint':
                 outputs_key = self.model.forward_key_frame(img_key, target_key)
-                loss_dict_key, key_indices = self.criterion(
-                    outputs_key, target_key, return_indices=True
-                )
+                if self.reuse_match_indices:
+                    loss_dict_key, key_indices = self.criterion(
+                        outputs_key, target_key, return_indices=True
+                    )
+                else:
+                    loss_dict_key = self.criterion(outputs_key, target_key)
                 # Remove all aux loss (drop multi-layer and DN losses)
                 final_loss_dict = {
                     k: v for k, v in loss_dict_key.items() 
@@ -128,9 +154,10 @@ class Phase1Trainer:
                 # For kd_only, decoder_only, and freeze_key
                 with torch.no_grad():
                     outputs_key = self.model.forward_key_frame(img_key, target_key)
-                    _, key_indices = self.criterion(
-                        outputs_key, target_key, return_indices=True
-                    )
+                    if self.reuse_match_indices:
+                        _, key_indices = self.criterion(
+                            outputs_key, target_key, return_indices=True
+                        )
 
             # 2. NON-KEY FRAME PATH (The Student)
             if self.training_strategy == 'kd_only':
@@ -156,8 +183,18 @@ class Phase1Trainer:
                 outputs_non_key = self.model.forward_non_key_frame(
                     img_non_key, target_non_key
                 )
+                criterion_kwargs = {}
+                if self.reuse_match_indices:
+                    if key_indices is None:
+                        raise RuntimeError("Expected key matcher indices, but got None with --reuse_match_indices")
+                    num_queries = outputs_non_key['pred_boxes'].shape[1]
+                    criterion_kwargs['cached_indices'] = self._sanitize_cached_indices(
+                        key_indices,
+                        target_non_key,
+                        num_queries,
+                    )
                 loss_dict_non_key = self.criterion(
-                    outputs_non_key, target_non_key, cached_indices=key_indices
+                    outputs_non_key, target_non_key, **criterion_kwargs
                 )
                 # RTDETRCriterionv2 already applies weight_dict internally.
                 loss_non_key = sum(loss_dict_non_key.values())
@@ -428,6 +465,8 @@ def main():
                        help='Diagnostic: Force non-key frame to be identical to key frame')
     parser.add_argument('--init_weights', action='store_true', 
                        help='Warm start: Copy pretrained key decoder weights to non-key decoder')
+    parser.add_argument('--reuse_match_indices', action='store_true',
+                       help='Reuse key-frame matcher indices for non-key loss (default: disabled)')
 
     # Optional
     parser.add_argument('--resume', '-r', type=str, default=None, 
@@ -494,6 +533,7 @@ def main():
         print(f"\nConfiguration:")
         print(f"  Epochs:           {epochs}")
         print(f"  Training strategy: {args.training_strategy}")
+        print(f"  Reuse match idx:  {args.reuse_match_indices}")
         print(f"  Lambda (non-key): {lambda_non_key}")
         print(f"  Output dir:       {output_dir}")
         print(f"  Seed:             {seed}")
@@ -525,6 +565,10 @@ def main():
     # Get criterion from config
     criterion = cfg.criterion
     print("\n=> Preparing Temporal Model for Optimizer Registration...")
+
+    if args.training_strategy == 'freeze_key' and not args.reuse_match_indices:
+        model.decouple_non_key_prediction_heads()
+        print("   Enabled decoupled non-key heads/query_pos for fresh-matcher training.")
     
     trainable_params = []
     
@@ -547,7 +591,14 @@ def main():
                 
         elif args.training_strategy == 'freeze_key':
             # Train fusion blocks and lightweight decoder. Freeze heavy model.
-            if 'fusion_blocks' in name or 'lightweight_decoder.decoder' in name:
+            train_prediction_modules = (
+                not args.reuse_match_indices and (
+                    'lightweight_decoder.dec_score_head' in name
+                    or 'lightweight_decoder.dec_bbox_head' in name
+                    or 'lightweight_decoder.query_pos_head' in name
+                )
+            )
+            if 'fusion_blocks' in name or 'lightweight_decoder.decoder' in name or train_prediction_modules:
                 param.requires_grad = True
                 trainable_params.append(param)
             else:
@@ -597,7 +648,8 @@ def main():
         print_freq=print_freq,
         clip_max_norm=clip_max_norm,
         training_strategy=args.training_strategy,
-        same_frame=args.same_frame
+        same_frame=args.same_frame,
+        reuse_match_indices=args.reuse_match_indices,
     )
     
     if args.eval_only:

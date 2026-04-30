@@ -45,7 +45,7 @@ val_dataloader:
     type: ViratTemporalDataset
     root_dir: ../dataset/mot17/val/
     ann_file: ../dataset/mot17/val.json
-    max_frame_gap: 4
+    max_frame_gap: 1
     pair_sampling_strategy: "fixed_gap"
     frame_stride: 1
     transforms:
