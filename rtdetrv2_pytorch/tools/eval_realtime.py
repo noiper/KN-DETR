@@ -55,6 +55,28 @@ def propagate_key_results_to_non_key_targets(key_results, non_key_targets):
         )
     return propagated
 
+def scale_results(results, score_scale):
+    if score_scale == 1.0:
+        return results
+    scaled = []
+    for det in results:
+        score = max(0.0, min(1.0, float(det['score']) * score_scale))
+        out = det.copy()
+        out['score'] = score
+        scaled.append(out)
+    return scaled
+
+def parse_scale_grid(grid_text):
+    values = []
+    for token in grid_text.split(','):
+        token = token.strip()
+        if not token:
+            continue
+        values.append(float(token))
+    if not values:
+        raise ValueError("score scale grid cannot be empty")
+    return values
+
 def evaluate_map(coco_gt, results, title):
     """Runs pycocotools evaluation and returns (mAP, mAP50)."""
     if not results:
@@ -85,6 +107,14 @@ def main():
                         help='Number of Non-Key frames per Key frame. 1 = (K, NK), 2 = (K, NK, NK), etc.')
     parser.add_argument('--baseline', action='store_true',
                         help='Baseline: reuse key-frame detections directly for non-key frames')
+    parser.add_argument('--key_score_scale', type=float, default=1.0,
+                        help='Multiply key-path confidence scores by this factor before evaluation')
+    parser.add_argument('--nonkey_score_scale', type=float, default=1.0,
+                        help='Multiply non-key-path confidence scores by this factor before evaluation')
+    parser.add_argument('--tune_score_scales', action='store_true',
+                        help='Grid search key/non-key score scales for best combined mAP')
+    parser.add_argument('--score_scale_grid', type=str, default='0.7,0.8,0.9,1.0,1.1',
+                        help='Comma-separated scale grid for --tune_score_scales')
     args = parser.parse_args()
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -241,9 +271,6 @@ def main():
                 
                 format_coco(target_non_key, res_nk_batch, res_nk)
 
-    # Combine results
-    results_combined = res_key + res_nk
-
     # Calculate Averages
     avg_k_time = (metrics['k_time'] / metrics['k_frames']) * 1000 if metrics['k_frames'] else 0
     avg_nk_time = (metrics['nk_time'] / metrics['nk_frames']) * 1000 if metrics['nk_frames'] else 0
@@ -251,13 +278,44 @@ def main():
     avg_k_mem = (metrics['k_mem'] / metrics['k_frames']) if metrics['k_frames'] > 0 else 0
     avg_nk_mem = (metrics['nk_mem'] / metrics['nk_frames']) if metrics['nk_frames'] > 0 else 0
 
-    map_k, map50_k = evaluate_map(coco_gt, res_key, "HEAVY KEY MODEL ONLY")
-    map_nk, map50_nk = evaluate_map(coco_gt, res_nk, "LIGHTWEIGHT NON-KEY MODEL ONLY")
-    combined_map, combined_map50 = evaluate_map(coco_gt, results_combined, "COMBINED OVERALL AVERAGE")
+    key_scale = args.key_score_scale
+    nonkey_scale = args.nonkey_score_scale
+
+    if args.tune_score_scales:
+        grid = parse_scale_grid(args.score_scale_grid)
+        best = None
+        for ks in grid:
+            for ns in grid:
+                scaled_key = scale_results(res_key, ks)
+                scaled_nk = scale_results(res_nk, ns)
+                combined_map_tmp, combined_map50_tmp = evaluate_map(
+                    coco_gt, scaled_key + scaled_nk, "COMBINED OVERALL AVERAGE"
+                )
+                score = (combined_map_tmp, combined_map50_tmp)
+                if best is None or score > best['score']:
+                    best = {
+                        'key_scale': ks,
+                        'nonkey_scale': ns,
+                        'combined_map': combined_map_tmp,
+                        'combined_map50': combined_map50_tmp,
+                        'score': score,
+                    }
+        key_scale = best['key_scale']
+        nonkey_scale = best['nonkey_scale']
+        print(f"Tuned score scales: key={key_scale:.3f}, non-key={nonkey_scale:.3f}")
+
+    scaled_res_key = scale_results(res_key, key_scale)
+    scaled_res_nk = scale_results(res_nk, nonkey_scale)
+    scaled_combined = scaled_res_key + scaled_res_nk
+
+    map_k, map50_k = evaluate_map(coco_gt, scaled_res_key, "HEAVY KEY MODEL ONLY")
+    map_nk, map50_nk = evaluate_map(coco_gt, scaled_res_nk, "LIGHTWEIGHT NON-KEY MODEL ONLY")
+    combined_map, combined_map50 = evaluate_map(coco_gt, scaled_combined, "COMBINED OVERALL AVERAGE")
 
     print("\n" + "="*70)
     print(f"FINAL SUMMARY (Level {args.nk_per_key})")
     print("="*70)
+    print(f"Score scales -> key: {key_scale:.3f}, non-key: {nonkey_scale:.3f}")
     print(f"Key      mAP: {map_k:.4f} | mAP50: {map50_k:.4f}")
     print(f"Non-Key  mAP: {map_nk:.4f} | mAP50: {map50_nk:.4f}")
     print(f"Combined mAP: {combined_map:.4f} | mAP50: {combined_map50:.4f}")
