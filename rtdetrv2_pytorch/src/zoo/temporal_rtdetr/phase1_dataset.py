@@ -57,22 +57,10 @@ class ViratTemporalDataset(Dataset):
         self.frame_stride = frame_stride
 
         self.coco = COCO(ann_file)
-
-        # Load annotations
-        ann_file_path = Path(ann_file)
-        if not ann_file_path.exists():
-            raise FileNotFoundError(f"Annotation file not found: {ann_file}")
-            
-        with open(ann_file, 'r') as f:
-            self.virat_data = json.load(f)
-
-        self.img_id_to_info = {img['id']: img for img in self.virat_data['images']}
-        self.img_id_to_anns = {}
-        for ann in self.virat_data['annotations']:
-            image_id = ann['image_id'] 
-            if image_id not in self.img_id_to_anns:
-                self.img_id_to_anns[image_id] = []
-            self.img_id_to_anns[image_id].append(ann)
+        
+        # Use COCO's internal indexing to save memory
+        self.img_id_to_info = self.coco.imgs
+        self.img_id_to_anns = self.coco.imgToAnns
         
         # Build video-frame mapping
         self.video_frames = self._build_video_frame_mapping()
@@ -82,15 +70,14 @@ class ViratTemporalDataset(Dataset):
         print(f"Loaded {len(self.samples)} 'frame pairs from VIRAT dataset")
         print(f"  Max frame gap: {self.max_frame_gap}")
         print(f"  Sampling strategy: {self.pair_sampling_strategy}")
-        if self.pair_sampling_strategy in ["stride", "stride_random"]:
-            print(f"  Frame stride: {self.frame_stride}")
+        print(f"  Frame stride: {self.frame_stride}")
         print(f"  Transforms: {type(self.transforms).__name__ if self.transforms else 'Default (resize to 640x640)'}")
     
     def _build_video_frame_mapping(self) -> Dict[str, List[Dict]]:
         """Build mapping from video_id to sorted list of frames"""
         video_frames = {}
         
-        for img_info in self.virat_data['images']:
+        for img_info in self.coco.dataset['images']:
             video_id = self._extract_video_id(img_info['file_name'])
             
             if video_id not in video_frames:
@@ -131,15 +118,13 @@ class ViratTemporalDataset(Dataset):
             return self._build_pairs_all()
         elif strategy == "random_single":
             return self._build_pairs_random_single()
-        elif strategy == "fixed_gap":
-            return self._build_pairs_fixed_gap()
-        elif strategy == "stride":
+        elif strategy in ["fixed_gap", "stride"]: # Treat fixed_gap as stride with frame_stride
             return self._build_pairs_stride()
         elif strategy == "stride_random":
             return self._build_pairs_stride_random()
         else:
-            print(f"Warning: Unknown sampling strategy '{strategy}', using 'random_single'")
-            return self._build_pairs_random_single()
+            print(f"Warning: Unknown sampling strategy '{strategy}', using 'stride'")
+            return self._build_pairs_stride()
     
     def _build_pairs_all(self) -> List[Tuple[Dict, Dict]]:
         """
@@ -161,11 +146,12 @@ class ViratTemporalDataset(Dataset):
     def _build_pairs_random_single(self) -> List[Tuple[Dict, Dict]]:
         """
         Strategy: 'random_single'
-        Sample ONE random gap per frame
+        Sample ONE random gap per frame, respecting frame_stride
         """
         samples = []
         for _, frames in self.video_frames.items():
-            for i, frame_t in enumerate(frames):
+            for i in range(0, len(frames), self.frame_stride):
+                frame_t = frames[i]
                 max_offset = min(self.max_frame_gap + 1, len(frames) - i)
                 if max_offset > 1:
                     s = random.randint(1, max_offset - 1)
@@ -177,16 +163,9 @@ class ViratTemporalDataset(Dataset):
     def _build_pairs_fixed_gap(self) -> List[Tuple[Dict, Dict]]:
         """
         Strategy: 'fixed_gap'
-        Use only max_frame_gap as the gap
+        Use only max_frame_gap as the gap, respecting frame_stride
         """
-        samples = []
-        for _, frames in self.video_frames.items():
-            for i, frame_t in enumerate(frames):
-                if i + self.max_frame_gap < len(frames):
-                    frame_t_s = frames[i + self.max_frame_gap]
-                    samples.append((frame_t, frame_t_s))
-        
-        return samples
+        return self._build_pairs_stride()
     
     def _build_pairs_stride(self) -> List[Tuple[Dict, Dict]]:
         """

@@ -510,6 +510,8 @@ class RTDETRTransformerv2(nn.Module):
         else:
             anchors = self.anchors
             valid_mask = self.valid_mask
+            if anchors.shape[1] != memory.shape[1]:
+                anchors, valid_mask = self._generate_anchors(spatial_shapes, device=memory.device)
 
         # memory = torch.where(valid_mask, memory, 0)
         # TODO fix type error for onnx export 
