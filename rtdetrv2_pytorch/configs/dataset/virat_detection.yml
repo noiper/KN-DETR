@@ -12,8 +12,8 @@ train_dataloader:
   type: DataLoader
   dataset: 
     type: CocoDetection
-    img_folder: ../dataset/VIRAT/train_videos/
-    ann_file: ../dataset/VIRAT/train.json
+    img_folder: ../dataset/VIRAT/train_30/
+    ann_file: ../dataset/VIRAT/train_30.json
     return_masks: False
     transforms:
       type: Compose
@@ -29,8 +29,8 @@ val_dataloader:
   type: DataLoader
   dataset: 
     type: CocoDetection
-    img_folder: ../dataset/VIRAT/val_videos/
-    ann_file: ../dataset/VIRAT/val.json
+    img_folder: ../dataset/VIRAT/val_30/
+    ann_file: ../dataset/VIRAT/val_30.json
     return_masks: False
     transforms:
       type: Compose

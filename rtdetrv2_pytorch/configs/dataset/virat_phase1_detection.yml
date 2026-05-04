@@ -15,7 +15,7 @@ train_dataloader:
     ann_file: ../dataset/VIRAT/train_30.json
     max_frame_gap: 1
     pair_sampling_strategy: "all"
-    frame_stride: 10
+    frame_stride: 5
     transforms:
       type: Compose
       ops:
@@ -39,7 +39,7 @@ train_dataloader:
   collate_fn:
     type: TemporalBatchCollateFunction
     scales: [480, 512, 544, 576, 608, 640, 640, 640, 672, 704, 736, 768, 800]
-    stop_epoch: 14
+    stop_epoch: 7
 
 
 val_dataloader:
