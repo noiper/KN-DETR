@@ -27,7 +27,7 @@ def format_coco(targets, outputs, results_list):
         boxes = output['boxes'].cpu().numpy()
         scores = output['scores'].cpu().numpy()
         labels = output['labels'].cpu().numpy()
-        
+
         for i in range(len(scores)):
             x1, y1, x2, y2 = boxes[i]
             results_list.append({
@@ -159,7 +159,7 @@ def main():
     print(f"Loading weights from {args.weights}...")
     checkpoint = torch.load(args.weights, map_location=device, weights_only=False)
     state_dict = checkpoint.get('model_state_dict', checkpoint.get('model', checkpoint))
-    
+
     # --- AUTO-DECOUPLE DETECTION ---
     # If the checkpoint contains decoupled non-key heads, we MUST decouple the model
     # before loading to avoid overwriting the heavy decoder's heads with the student's.
@@ -262,7 +262,7 @@ def main():
                     
                     t2 = time.perf_counter()
                     
-                    # Relies on the cache stored during step == 0
+                    # Relies on the cache stored during key frame pass
                     out_nk = model.forward_non_key_frame(img_non_key, None)
                     
                     if torch.cuda.is_available():
@@ -298,8 +298,13 @@ def main():
             for ns in grid:
                 scaled_key = scale_results(res_key, ks)
                 scaled_nk = scale_results(res_nk, ns)
+                
+                # Filter out overlapping image IDs from non-key results
+                key_img_ids = set([det['image_id'] for det in scaled_key])
+                filtered_nk = [det for det in scaled_nk if det['image_id'] not in key_img_ids]
+                
                 combined_map_tmp, combined_map50_tmp = evaluate_map(
-                    coco_gt, scaled_key + scaled_nk, "COMBINED OVERALL AVERAGE"
+                    coco_gt, scaled_key + filtered_nk, "COMBINED OVERALL AVERAGE"
                 )
                 score = (combined_map_tmp, combined_map50_tmp)
                 if best is None or score > best['score']:
@@ -316,7 +321,11 @@ def main():
 
     scaled_res_key = scale_results(res_key, key_scale)
     scaled_res_nk = scale_results(res_nk, nonkey_scale)
-    scaled_combined = scaled_res_key + scaled_res_nk
+    
+    # Filter out overlapping image IDs from non-key results for final combined metric
+    final_key_img_ids = set([det['image_id'] for det in scaled_res_key])
+    final_filtered_nk = [det for det in scaled_res_nk if det['image_id'] not in final_key_img_ids]
+    scaled_combined = scaled_res_key + final_filtered_nk
 
     map_k, map50_k = evaluate_map(coco_gt, scaled_res_key, "HEAVY KEY MODEL ONLY")
     map_nk, map50_nk = evaluate_map(coco_gt, scaled_res_nk, "LIGHTWEIGHT NON-KEY MODEL ONLY")
