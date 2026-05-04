@@ -23,6 +23,7 @@ from src.zoo.temporal_rtdetr import TemporalRTDETR
 from src.core import YAMLConfig
 from pycocotools.cocoeval import COCOeval
 
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
 class Phase1Trainer:
@@ -32,7 +33,8 @@ class Phase1Trainer:
     - 'kd_only': Stage 1 - Train fusion blocks via Feature MSE. (same_frame disabled)
     - 'decoder_only': Stage 2 - Train light decoder via Hungarian. (same_frame disabled)
     
-    --- Legacy & Diagnostic Modes ---
+    --- Joint & Fine-tuning Modes ---
+    - 'kd': Joint Tuning - Train fusion + light decoder via Hungarian + Feature MSE.
     - 'freeze_key': Train fusion + light decoder via Hungarian. (same_frame supported)
     - 'joint': Train fusion + light decoder + key decoder via Hungarian. (same_frame supported)
     """
@@ -69,14 +71,18 @@ class Phase1Trainer:
         self.same_frame = same_frame
         self.reuse_match_indices = reuse_match_indices
         
-        valid_strategies = ['kd_only', 'decoder_only', 'freeze_key', 'joint']
+        valid_strategies = ['kd', 'kd_only', 'decoder_only', 'freeze_key', 'joint']
         if self.training_strategy not in valid_strategies:
             raise ValueError(f"Unknown training strategy: {self.training_strategy}. Must be one of {valid_strategies}")
-        if self.same_frame and self.training_strategy in ['kd_only', 'decoder_only']:
+        if self.same_frame and self.training_strategy in ['kd', 'kd_only', 'decoder_only']:
             print(f"  [Warning] --same_frame is not supported for '{self.training_strategy}'. Disabling it.")
             self.same_frame = False
 
         print(f"\nTraining Strategy: {self.training_strategy}")
+        if self.training_strategy == 'kd':
+               self.lambda_kd = getattr(self.cfg, 'lambda_kd', 1.0)
+               print(f"  - KD Loss weight (lambda_kd): {self.lambda_kd}")
+
         if self.same_frame:
             print("--same_frame is active.")
 
@@ -106,7 +112,7 @@ class Phase1Trainer:
         """
         self.model.train()
 
-        if self.training_strategy in ['kd_only', 'decoder_only', 'freeze_key']:
+        if self.training_strategy in ['kd', 'kd_only', 'decoder_only', 'freeze_key']:
             for name, module in self.model.named_modules():
                 # Force backbone and encoder normalizations to stay frozen
                 if 'backbone' in name or 'encoder' in name:
@@ -158,11 +164,11 @@ class Phase1Trainer:
                 loss = loss_key
                 loss_key_value = loss_key.item()
             else:
-                # For kd_only, decoder_only, and freeze_key
+                # For kd, kd_only, decoder_only, and freeze_key
                 self.model.backbone.eval()
                 if hasattr(self.model, 'encoder'):
                     self.model.encoder.eval()
-                if self.training_strategy in ['kd_only', 'decoder_only'] and hasattr(self.model, 'decoder'):
+                if self.training_strategy in ['kd', 'kd_only', 'decoder_only'] and hasattr(self.model, 'decoder'):
                     self.model.decoder.eval()
                 with torch.no_grad():
                     outputs_key = self.model.forward_key_frame(img_key, target_key)
@@ -172,8 +178,7 @@ class Phase1Trainer:
                         )
 
             # 2. NON-KEY FRAME PATH (The Student)
-            if self.training_strategy == 'kd_only':
-                import torch.nn.functional as F
+            if self.training_strategy in ['kd', 'kd_only']:
 
                 with torch.no_grad():
                     teacher_backbone_feats = self.model.backbone(img_non_key)
@@ -186,9 +191,28 @@ class Phase1Trainer:
                 
                 loss_kd = 0.0
                 for s_feat, t_feat in zip(student_fused, teacher_ccff):
-                    loss_kd += F.mse_loss(s_feat, t_feat)
+                    # Normalized MSE focuses on feature "shape" and relative relationships
+                    loss_kd += F.mse_loss(F.normalize(s_feat, dim=1), F.normalize(t_feat, dim=1))
                 
-                loss_non_key = loss_kd
+                if self.training_strategy == 'kd_only':
+                   loss_non_key = loss_kd
+                else:
+                    # Joint Tuning (kd strategy): Hungarian + Feature MSE
+                    criterion_kwargs = {}
+                    if self.reuse_match_indices:
+                        if key_indices is None:
+                            raise RuntimeError("Expected key matcher indices, but got None with --reuse_match_indices")
+                        num_queries = outputs_non_key['pred_boxes'].shape[1]
+                        criterion_kwargs['cached_indices'] = self._sanitize_cached_indices(
+                            key_indices,
+                            target_non_key,
+                            num_queries,
+                        )
+                    loss_dict_non_key = self.criterion(
+                        outputs_non_key, target_non_key, **criterion_kwargs
+                    )
+                    loss_hungarian = sum(loss_dict_non_key.values())
+                    loss_non_key = loss_hungarian + self.lambda_kd * loss_kd
 
             else:
                 # Standard Hungarian loss (decoder_only, freeze_key, and joint)
@@ -465,8 +489,8 @@ def main():
     
     parser.add_argument('--config', '-c', type=str, required=True)
     parser.add_argument('--training_strategy', type=str, default='freeze_key',
-                       choices=['freeze_key', 'joint', 'kd_only', 'decoder_only'],
-                       help='freeze_key, or joint')
+                        choices=['freeze_key', 'joint', 'kd', 'kd_only', 'decoder_only'],
+                        help='freeze_key, joint, kd, kd_only, or decoder_only')
     parser.add_argument('--pretrained', type=str, default=None,
                        help='Path to checkpoint (auto-detects key-only vs full temporal)')
     parser.add_argument('--eval_only', action='store_true',
@@ -479,6 +503,8 @@ def main():
                        help='Warm start: Copy pretrained key decoder weights to non-key decoder')
     parser.add_argument('--reuse_match_indices', action='store_true',
                        help='Reuse key-frame matcher indices for non-key loss (default: disabled)')
+    parser.add_argument('--lambda_kd', type=float, default=None,
+                       help='Weighted scale for KD loss (only used in kd strategy)')
 
     # Optional
     parser.add_argument('--resume', '-r', type=str, default=None, 
@@ -538,6 +564,9 @@ def main():
         checkpoint_freq = getattr(cfg, 'checkpoint_freq', 5)
         clip_max_norm = getattr(cfg, 'clip_max_norm', 0.1)
 
+        if args.lambda_kd is not None:
+            cfg.lambda_kd = args.lambda_kd
+
         summary_dir = getattr(cfg, 'summary_dir', os.path.join(output_dir, 'summary'))
         writer = SummaryWriter(log_dir=summary_dir)
         print(f"  Summary dir:      {summary_dir}")
@@ -578,7 +607,7 @@ def main():
     criterion = cfg.criterion
     print("\n=> Preparing Temporal Model for Optimizer Registration...")
 
-    if args.training_strategy == 'freeze_key' and not args.reuse_match_indices:
+    if args.training_strategy in ['freeze_key', 'kd'] and not args.reuse_match_indices:
         model.decouple_non_key_prediction_heads()
         print("   Enabled decoupled non-key heads/query_pos for fresh-matcher training.")
     
@@ -601,7 +630,7 @@ def main():
             else:
                 param.requires_grad = False
                 
-        elif args.training_strategy == 'freeze_key':
+        elif args.training_strategy in ['freeze_key', 'kd']:
             # Train fusion blocks and lightweight decoder. Freeze heavy model.
             train_prediction_modules = (
                 not args.reuse_match_indices and (
