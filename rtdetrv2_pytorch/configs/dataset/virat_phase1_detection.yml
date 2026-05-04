@@ -11,11 +11,11 @@ train_dataloader:
   type: DataLoader
   dataset: 
     type: ViratTemporalDataset
-    root_dir: ../dataset/VIRAT/train_videos/
-    ann_file: ../dataset/VIRAT/train.json
-    max_frame_gap: 3
+    root_dir: ../dataset/VIRAT/train_30/
+    ann_file: ../dataset/VIRAT/train_30.json
+    max_frame_gap: 1
     pair_sampling_strategy: "all"
-    frame_stride: 1
+    frame_stride: 10
     transforms:
       type: Compose
       ops:
@@ -39,18 +39,18 @@ train_dataloader:
   collate_fn:
     type: TemporalBatchCollateFunction
     scales: [480, 512, 544, 576, 608, 640, 640, 640, 672, 704, 736, 768, 800]
-    stop_epoch: 71
+    stop_epoch: 14
 
 
 val_dataloader:
   type: DataLoader
   dataset: 
     type: ViratTemporalDataset
-    root_dir: ../dataset/VIRAT/val_videos/
-    ann_file: ../dataset/VIRAT/val.json
+    root_dir: ../dataset/VIRAT/val_30/
+    ann_file: ../dataset/VIRAT/val_30.json
     max_frame_gap: 1
     pair_sampling_strategy: "fixed_gap"
-    frame_stride: 4
+    frame_stride: 10
     transforms:
       type: Compose
       ops: 

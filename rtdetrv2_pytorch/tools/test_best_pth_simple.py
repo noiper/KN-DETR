@@ -161,8 +161,15 @@ def load_pretrained_key_frame(model: TemporalRTDETR, pretrained_path: str, devic
     """
     print(f"\nLoading pretrained key frame path from: {pretrained_path}")
     
-    checkpoint = torch.load(pretrained_path, map_location=device)
-    state_dict = checkpoint['model']
+    checkpoint = torch.load(pretrained_path, map_location=device, weights_only=False)
+    state_dict = checkpoint.get('model_state_dict', checkpoint.get('model', checkpoint))
+
+    # --- AUTO-DECOUPLE DETECTION ---
+    is_decoupled = any('lightweight_decoder.dec_score_head' in k for k in state_dict.keys())
+    if is_decoupled:
+        print("   [Auto-Detect] Decoupled prediction heads found in checkpoint. Decoupling model...")
+        model.decouple_non_key_prediction_heads()
+
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     
     if missing_keys:

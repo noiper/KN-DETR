@@ -103,6 +103,13 @@ def main():
     print(f"Loading weights from {args.weights}...")
     checkpoint = torch.load(args.weights, map_location=device, weights_only=False)
     state_dict = checkpoint.get('model_state_dict', checkpoint.get('model', checkpoint))
+
+    # --- AUTO-DECOUPLE DETECTION ---
+    is_decoupled = any('lightweight_decoder.dec_score_head' in k for k in state_dict.keys())
+    if is_decoupled:
+        print("   [Auto-Detect] Decoupled prediction heads found in checkpoint. Decoupling model...")
+        model.decouple_non_key_prediction_heads()
+    
     model.load_state_dict(state_dict, strict=True)
     model.eval()
     
@@ -152,7 +159,6 @@ def main():
             res_key = postprocessor(outputs_key, orig_sizes_k)
             
             format_to_coco_results(target_key, res_key, results_key)
-            format_to_coco_results(target_key, res_key, results_all)
             
             # --- PHASE B: NON-KEY FRAME INFERENCE ---
             has_non_key = (img_non_key is not None) and (len(img_non_key) > 0)
@@ -178,7 +184,6 @@ def main():
                 res_nk = postprocessor(outputs_nk, orig_sizes_nk)
                 
                 format_to_coco_results(target_non_key, res_nk, results_non_key)
-                format_to_coco_results(target_non_key, res_nk, results_all)
 
     # 5. Execute COCO Metrics
     print("\n" + "="*60)
@@ -187,6 +192,12 @@ def main():
     
     map_key = run_coco_eval(coco_gt, results_key, "KEY FRAMES ONLY")
     map_nk = run_coco_eval(coco_gt, results_non_key, "NON-KEY FRAMES ONLY")
+    
+    # Combined results: prefer Key frame predictions for overlapping image IDs
+    key_img_ids = set([det['image_id'] for det in results_key])
+    filtered_nk = [det for det in results_non_key if det['image_id'] not in key_img_ids]
+    results_all = results_key + filtered_nk
+    
     map_all = run_coco_eval(coco_gt, results_all, "COMBINED OVERALL AVERAGE")
     
     # 6. Calculate Latency Metrics

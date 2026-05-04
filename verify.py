@@ -20,8 +20,8 @@ def compare_models(path1, path2):
     sd2 = extract_state_dict(ckpt2)
 
     # Filter only the keys belonging to the lightweight decoder
-    lw_keys1 = {k: v for k, v in sd1.items() if 'lightweight_decoder' in k}
-    lw_keys2 = {k: v for k, v in sd2.items() if 'lightweight_decoder' in k}
+    lw_keys1 = {k: v for k, v in sd1.items()}
+    lw_keys2 = {k: v for k, v in sd2.items()}
 
     if not lw_keys1 or not lw_keys2:
         print("\n❌ Error: Could not find 'lightweight_decoder' keys in one or both models.")

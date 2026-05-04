@@ -106,6 +106,13 @@ class Phase1Trainer:
         """
         self.model.train()
 
+        if self.training_strategy in ['kd_only', 'decoder_only', 'freeze_key']:
+            for name, module in self.model.named_modules():
+                # Force backbone and encoder normalizations to stay frozen
+                if 'backbone' in name or 'encoder' in name:
+                    module.eval()
+                if 'decoder' in name and 'lightweight_decoder' not in name:
+                    module.eval()
         total_loss = 0.0
         total_loss_key = 0.0
         total_loss_non_key = 0.0
@@ -152,6 +159,11 @@ class Phase1Trainer:
                 loss_key_value = loss_key.item()
             else:
                 # For kd_only, decoder_only, and freeze_key
+                self.model.backbone.eval()
+                if hasattr(self.model, 'encoder'):
+                    self.model.encoder.eval()
+                if self.training_strategy in ['kd_only', 'decoder_only'] and hasattr(self.model, 'decoder'):
+                    self.model.decoder.eval()
                 with torch.no_grad():
                     outputs_key = self.model.forward_key_frame(img_key, target_key)
                     if self.reuse_match_indices:

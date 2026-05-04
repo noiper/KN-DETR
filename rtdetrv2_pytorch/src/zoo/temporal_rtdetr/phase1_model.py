@@ -273,17 +273,32 @@ class TemporalRTDETR(nn.Module):
         
         return outputs
     
-    def forward_non_key_frame(self, img: torch.Tensor, targets: Optional[List[Dict]] = None, return_fused: bool = False) -> Dict:
+    def forward_non_key_frame(self, img: torch.Tensor, targets: Optional[List[Dict]] = None, return_fused: bool = False,
+                              cached_ccff: Optional[List[torch.Tensor]] = None,
+                              cached_content: Optional[torch.Tensor] = None,
+                              cached_points_unact: Optional[torch.Tensor] = None) -> Dict:
         """
         Forward non-key frame through lightweight pipeline with fusion
         
         Args:
             img: Non-key frame image [B, C, H, W]
             targets: Ground truth annotations
+            return_fused: Whether to return fused features
+            cached_ccff: Optional cached multi-scale features (for ONNX export)
+            cached_content: Optional cached query content (for ONNX export)
+            cached_points_unact: Optional cached reference points (for ONNX export)
         
         Returns:
             outputs: Detection outputs
         """
+        # Override internal cache if provided (for deployment/ONNX)
+        if cached_ccff is not None:
+            self.cached_ccff = cached_ccff
+        if cached_content is not None:
+            self.cached_content = cached_content
+        if cached_points_unact is not None:
+            self.cached_points_unact = cached_points_unact
+
         if self.cached_ccff is None:
             raise RuntimeError("Key frame must be processed first to cache CCFF features")
         if self.cached_content is None or self.cached_points_unact is None:
@@ -317,7 +332,14 @@ class TemporalRTDETR(nn.Module):
         if return_fused:
             return outputs, fused_features
         return outputs
-    
+
+    def deploy(self):
+        self.eval()
+        for m in self.modules():
+            if hasattr(m, 'convert_to_deploy'):
+                m.convert_to_deploy()
+        return self
+
     def forward(self, key_frame: torch.Tensor, non_key_frame: torch.Tensor, 
                 key_targets: Optional[List[Dict]] = None, 
                 non_key_targets: Optional[List[Dict]] = None) -> Tuple[Dict, Dict]:

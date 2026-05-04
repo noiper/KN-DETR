@@ -113,7 +113,7 @@ def main():
                         help='Multiply non-key-path confidence scores by this factor before evaluation')
     parser.add_argument('--tune_score_scales', action='store_true',
                         help='Grid search key/non-key score scales for best combined mAP')
-    parser.add_argument('--score_scale_grid', type=str, default='0.7,0.8,0.9,1.0,1.1',
+    parser.add_argument('--score_scale_grid', type=str, default='0.8,0.9,1.0,1.1,1.2',
                         help='Comma-separated scale grid for --tune_score_scales')
     args = parser.parse_args()
     
@@ -158,7 +158,17 @@ def main():
     # 3. Load Weights
     print(f"Loading weights from {args.weights}...")
     checkpoint = torch.load(args.weights, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint.get('model_state_dict', checkpoint.get('model', checkpoint)), strict=True)
+    state_dict = checkpoint.get('model_state_dict', checkpoint.get('model', checkpoint))
+    
+    # --- AUTO-DECOUPLE DETECTION ---
+    # If the checkpoint contains decoupled non-key heads, we MUST decouple the model
+    # before loading to avoid overwriting the heavy decoder's heads with the student's.
+    is_decoupled = any('lightweight_decoder.dec_score_head' in k for k in state_dict.keys())
+    if is_decoupled:
+        print("   [Auto-Detect] Decoupled prediction heads found in checkpoint. Decoupling model...")
+        model.decouple_non_key_prediction_heads()
+    
+    model.load_state_dict(state_dict, strict=True)
     model.eval()
     
     # --- PHYSICAL DATALOADER REBUILD FOR BATCH_SIZE=1 ---

@@ -95,7 +95,15 @@ def main():
     # 3. Load Weights
     print(f"Loading weights from {args.weights}...")
     checkpoint = torch.load(args.weights, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint.get('model_state_dict', checkpoint.get('model', checkpoint)), strict=True)
+    state_dict = checkpoint.get('model_state_dict', checkpoint.get('model', checkpoint))
+
+    # --- AUTO-DECOUPLE DETECTION ---
+    is_decoupled = any('lightweight_decoder.dec_score_head' in k for k in state_dict.keys())
+    if is_decoupled:
+        print("   [Auto-Detect] Decoupled prediction heads found in checkpoint. Decoupling model...")
+        model.decouple_non_key_prediction_heads()
+    
+    model.load_state_dict(state_dict, strict=True)
     model.eval()
     
     val_dataloader = cfg.val_dataloader
