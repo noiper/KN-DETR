@@ -175,8 +175,9 @@ rtdetr_pytorch/dataset/
 rtdetrv2_pytorch/output/
 rtdetrv2_pytorch/dataset/
 
-# Ignore all training outputs
+# Ignore all training outputs and saved models
 output/
+models/
 
 AGENTS.md
 GEMINI.md
