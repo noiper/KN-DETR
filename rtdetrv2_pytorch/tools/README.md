@@ -135,3 +135,32 @@ For tasks like exporting or running inference, which don't need to run for days,
         ```bash
         docker compose down
         ```
+
+### Phase1 pretrained loading safety (temporal training)
+
+When using `tools/phase1_training_v2.py` with a temporal checkpoint (`--pretrained`), the script now:
+- auto-detects temporal checkpoints,
+- decouples non-key prediction heads before strict load,
+- runs a key-path integrity check (`backbone.*`, `encoder.*`, `decoder.*`) immediately after loading.
+
+This prevents silent key-head overwrite when a checkpoint contains both `decoder.*` and `lightweight_decoder.*`.
+
+Recommended verification before training:
+
+```bash
+python rtdetrv2_pytorch/tools/phase1_training_v2.py \
+  -c rtdetrv2_pytorch/configs/rtdetrv2/phase1_virat_r18vd.yml \
+  --pretrained output/phase1_virat_level0/06_433_718.pth \
+  --training_strategy freeze_key \
+  --verify_pretrained_only
+```
+
+Then run real training:
+
+```bash
+python rtdetrv2_pytorch/tools/phase1_training_v2.py \
+  -c rtdetrv2_pytorch/configs/rtdetrv2/phase1_virat_r18vd.yml \
+  --pretrained output/phase1_virat_level0/06_433_718.pth \
+  --training_strategy freeze_key \
+  --eval_before_train
+```

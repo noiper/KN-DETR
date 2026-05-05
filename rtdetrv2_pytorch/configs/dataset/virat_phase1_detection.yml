@@ -13,7 +13,7 @@ train_dataloader:
     type: ViratTemporalDataset
     root_dir: ../dataset/VIRAT/train_30/
     ann_file: ../dataset/VIRAT/train_30.json
-    max_frame_gap: 1
+    max_frame_gap: 4
     pair_sampling_strategy: "all"
     frame_stride: 5
     transforms:

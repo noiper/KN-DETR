@@ -33,7 +33,7 @@ class ViratTemporalDataset(Dataset):
         ann_file: str,
         transforms=None,
         max_frame_gap: int = 10,
-        pair_sampling_strategy: str = "random_single",
+        pair_sampling_strategy: str = "random",
         frame_stride: int = 1,
     ):
         """
@@ -44,11 +44,9 @@ class ViratTemporalDataset(Dataset):
             max_frame_gap: Maximum frame gap 's' for sampling (1 to max_frame_gap)
             pair_sampling_strategy: Strategy for sampling frame pairs:
                 - "all": Sample all possible gaps (1 to max_frame_gap)
-                - "random_single": Sample ONE random gap per frame
+                - "random": Sample ONE random gap per frame
                 - "fixed_gap": Use only max_frame_gap as the gap
-                - "stride": Sample key frames every 'frame_stride' frames - Reduces dataset size
-                - "stride_random": Combine stride + random gap - Most efficient
-            frame_stride: When using "stride" strategies, sample key frames every N frames
+            frame_stride: Sample key frames every N frames
         """
         self.root_dir = Path(root_dir)
         self.transforms = transforms
@@ -116,15 +114,13 @@ class ViratTemporalDataset(Dataset):
         
         if strategy == "all":
             return self._build_pairs_all()
-        elif strategy == "random_single":
-            return self._build_pairs_random_single()
-        elif strategy in ["fixed_gap", "stride"]: # Treat fixed_gap as stride with frame_stride
-            return self._build_pairs_stride()
-        elif strategy == "stride_random":
-            return self._build_pairs_stride_random()
+        elif strategy == "random":
+            return self._build_pairs_random()
+        elif strategy == "fixed_gap":
+            return self._build_pairs_fixed_gap()
         else:
-            print(f"Warning: Unknown sampling strategy '{strategy}', using 'stride'")
-            return self._build_pairs_stride()
+            print(f"Warning: Unknown sampling strategy '{strategy}', using 'fixed_gap'")
+            return self._build_pairs_fixed_gap()
     
     def _build_pairs_all(self) -> List[Tuple[Dict, Dict]]:
         """
@@ -143,9 +139,9 @@ class ViratTemporalDataset(Dataset):
         
         return samples
     
-    def _build_pairs_random_single(self) -> List[Tuple[Dict, Dict]]:
+    def _build_pairs_random(self) -> List[Tuple[Dict, Dict]]:
         """
-        Strategy: 'random_single'
+        Strategy: 'random'
         Sample ONE random gap per frame, respecting frame_stride
         """
         samples = []
@@ -163,14 +159,7 @@ class ViratTemporalDataset(Dataset):
     def _build_pairs_fixed_gap(self) -> List[Tuple[Dict, Dict]]:
         """
         Strategy: 'fixed_gap'
-        Use only max_frame_gap as the gap, respecting frame_stride
-        """
-        return self._build_pairs_stride()
-    
-    def _build_pairs_stride(self) -> List[Tuple[Dict, Dict]]:
-        """
-        Strategy: 'stride'
-        Sample key frames every 'frame_stride' frames, use fixed gap
+        Sample key frames every 'frame_stride' frames, use fixed gap (max_frame_gap)
         """
         samples = []
         for _, frames in self.video_frames.items():
@@ -179,24 +168,6 @@ class ViratTemporalDataset(Dataset):
                 frame_t = frames[i]
                 if i + self.max_frame_gap < len(frames):
                     frame_t_s = frames[i + self.max_frame_gap]
-                    samples.append((frame_t, frame_t_s))
-        
-        return samples
-    
-    def _build_pairs_stride_random(self) -> List[Tuple[Dict, Dict]]:
-        """
-        Strategy: 'stride_random'
-        Sample key frames every 'frame_stride' frames, random gap per key frame
-        """
-        samples = []
-        for _, frames in self.video_frames.items():
-            # Only use every N-th frame as key frame
-            for i in range(0, len(frames), self.frame_stride):
-                frame_t = frames[i]
-                max_offset = min(self.max_frame_gap + 1, len(frames) - i)
-                if max_offset > 1:
-                    s = random.randint(1, max_offset - 1)
-                    frame_t_s = frames[i + s]
                     samples.append((frame_t, frame_t_s))
         
         return samples

@@ -21,7 +21,7 @@ class VisDroneTemporalDataset(CocoDetection):
 
     def __init__(self, root_dir, ann_file, transforms=None, return_masks=False, 
                  remap_mscoco_category=False,
-                 pair_sampling_strategy='stride', frame_stride=2, max_frame_gap=1):
+                 pair_sampling_strategy='random', frame_stride=1, max_frame_gap=10):
         
         # Inherit from vanilla PyTorch CocoDetection to stop hidden prepare() calls
         super().__init__(root_dir, ann_file)
@@ -69,16 +69,8 @@ class VisDroneTemporalDataset(CocoDetection):
         for seq_name, frames in self.sequences.items():
             num_frames = len(frames)
             
-            if self.pair_sampling_strategy == 'stride':
+            if self.pair_sampling_strategy == 'random':
                 for i in range(0, num_frames, self.frame_stride):
-                    k_info = frames[i]
-                    nk_idx = i + self.max_frame_gap
-                    if nk_idx < num_frames:
-                        nk_info = frames[nk_idx]
-                        self.pairs.append((k_info['id'], nk_info['id']))
-                        
-            elif self.pair_sampling_strategy == 'random_single':
-                for i in range(num_frames - 1):
                     k_info = frames[i]
                     max_idx = min(i + self.max_frame_gap, num_frames - 1)
                     if max_idx > i:
@@ -87,10 +79,20 @@ class VisDroneTemporalDataset(CocoDetection):
                         self.pairs.append((k_info['id'], nk_info['id']))
                         
             elif self.pair_sampling_strategy == 'fixed_gap':
-                for i in range(0, num_frames - self.max_frame_gap, self.frame_stride):
+                for i in range(0, num_frames, self.frame_stride):
                     k_info = frames[i]
-                    nk_info = frames[i + self.max_frame_gap]
-                    self.pairs.append((k_info['id'], nk_info['id']))
+                    nk_idx = i + self.max_frame_gap
+                    if nk_idx < num_frames:
+                        nk_info = frames[nk_idx]
+                        self.pairs.append((k_info['id'], nk_info['id']))
+            
+            elif self.pair_sampling_strategy == 'all':
+                for i in range(0, num_frames, self.frame_stride):
+                    k_info = frames[i]
+                    max_offset = min(self.max_frame_gap + 1, num_frames - i)
+                    for s in range(1, max_offset):
+                        nk_info = frames[i + s]
+                        self.pairs.append((k_info['id'], nk_info['id']))
 
     def load_item(self, img_id):
         """Helper to load a raw image and manually format tv_tensors"""

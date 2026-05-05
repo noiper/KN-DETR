@@ -77,17 +77,25 @@ def parse_scale_grid(grid_text):
         raise ValueError("score scale grid cannot be empty")
     return values
 
-def evaluate_map(coco_gt, results, title):
+def evaluate_map(coco_gt, results, title, img_ids=None):
     """Runs pycocotools evaluation and returns (mAP, mAP50)."""
-    if not results:
+    if not results and not img_ids:
         return 0.0, 0.0
-    coco_dt = coco_gt.loadRes(results)
+        
+    if not results:
+        coco_dt = coco_gt.loadRes([])
+    else:
+        coco_dt = coco_gt.loadRes(results)
+        
     evaluator = COCOeval(coco_gt, coco_dt, 'bbox')
     
     # STRICTLY LIMIT EVALUATION TO THE IMAGES PREDICTED
     # Prevents artificial deflation when evaluating partial streams
-    predicted_img_ids = sorted(list(set([res['image_id'] for res in results])))
-    evaluator.params.imgIds = predicted_img_ids
+    if img_ids is not None:
+        evaluator.params.imgIds = sorted(list(img_ids))
+    else:
+        predicted_img_ids = sorted(list(set([res['image_id'] for res in results])))
+        evaluator.params.imgIds = predicted_img_ids
     
     evaluator.evaluate()
     evaluator.accumulate()
@@ -98,6 +106,14 @@ def evaluate_map(coco_gt, results, title):
         return 0.0, 0.0
     return evaluator.stats[0], evaluator.stats[1]
 
+def extract_video_id(file_name):
+    """Extract video ID from filename (matches ViratTemporalDataset logic)"""
+    import os
+    parts = os.path.normpath(file_name).split(os.sep)
+    if len(parts) > 1:
+        return parts[0]
+    return "default_video"
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Temporal RT-DETR in Real-Time Simulation")
     parser.add_argument('-c', '--config', type=str, required=True, help='Path to config yml')
@@ -105,6 +121,8 @@ def main():
     parser.add_argument('--warmup', type=int, default=10, help='Ignore first N batches for timing/memory')
     parser.add_argument('--nk_per_key', type=int, default=1, 
                         help='Number of Non-Key frames per Key frame. 1 = (K, NK), 2 = (K, NK, NK), etc.')
+    parser.add_argument('--frame_stride', type=int, default=1,
+                        help='Stride between Key sequences. Overrides YAML config for clean usage.')
     parser.add_argument('--baseline', action='store_true',
                         help='Baseline: reuse key-frame detections directly for non-key frames')
     parser.add_argument('--key_score_scale', type=float, default=1.0,
@@ -130,6 +148,12 @@ def main():
             cfg.yaml_cfg['val_dataloader']['batch_size'] = 1
         if 'drop_last' in cfg.yaml_cfg['val_dataloader']:
             cfg.yaml_cfg['val_dataloader']['drop_last'] = False
+
+        if 'dataset' in cfg.yaml_cfg['val_dataloader']:
+            print("Forcing dataset max_frame_gap=1, frame_stride=1, pair_sampling_strategy='all' to simulate continuous stream.")
+            cfg.yaml_cfg['val_dataloader']['dataset']['max_frame_gap'] = 1
+            cfg.yaml_cfg['val_dataloader']['dataset']['frame_stride'] = 1
+            cfg.yaml_cfg['val_dataloader']['dataset']['pair_sampling_strategy'] = 'all'
     
     # 2. Build Model Architecture
     base_model = cfg.model.to(device)
@@ -191,6 +215,8 @@ def main():
     
     res_key = []
     res_nk = []
+    eval_img_ids_key = set()
+    eval_img_ids_nk = set()
     latest_key_results = None
     
     metrics = {
@@ -199,19 +225,32 @@ def main():
     }
 
     # The length of one full cycle (e.g., K-NK-NK has a cycle length of 3)
-    cycle_len = args.nk_per_key + 1
+    # If frame_stride is larger than the sequence length, we skip frames between sequences.
+    cycle_len = max(args.frame_stride, args.nk_per_key + 1)
+    cycle_step = 0
+    last_video_id = None
 
     print(f"\n--- INITIATING REAL-TIME STREAM SIMULATION (1 Key : {args.nk_per_key} Non-Key) ---")
     with torch.no_grad():
         for i, batch in enumerate(tqdm(val_dataloader, desc="Streaming Video")):
             img_key, target_key, img_non_key, target_non_key = batch
             
-            # Determine where we are in the K-NK cycle
-            step = i % cycle_len
+            # --- VIDEO BOUNDARY DETECTION & CYCLE RESET ---
+            img_id = int(target_key[0]['image_id'].item())
+            img_info = val_dataloader.dataset.img_id_to_info[img_id]
+            current_video_id = extract_video_id(img_info['file_name'])
             
-            if step == args.nk_per_key:
-                # SKIP BATCH: The img_non_key in this batch is the next cycle's Key frame.
-                # If we evaluate it here, we double-count it.
+            if last_video_id is not None and current_video_id != last_video_id:
+                # Video changed! Reset the simulation cycle to start with a Key frame.
+                cycle_step = 0
+            last_video_id = current_video_id
+            
+            # Determine where we are in the K-NK cycle
+            step = cycle_step % cycle_len
+            
+            if step >= args.nk_per_key:
+                # SKIP BATCH: Either the next cycle's overlapping frame, or we are in the inter-sequence stride gap.
+                cycle_step += 1
                 continue
             
             # ==========================================
@@ -242,6 +281,8 @@ def main():
                 orig_sizes_k = torch.stack([t["orig_size"] for t in target_key], dim=0).to(device)
                 latest_key_results = postprocessor(out_k, orig_sizes_k)
                 format_coco(target_key, latest_key_results, res_key)
+                for t in target_key:
+                    eval_img_ids_key.add(int(t['image_id'].item()))
             
             # ==========================================
             # NON-KEY FRAME ARRIVES (Every step except the skipped one)
@@ -280,6 +321,10 @@ def main():
                             metrics['nk_mem'] += torch.cuda.max_memory_allocated() / (1024 ** 2)
                 
                 format_coco(target_non_key, res_nk_batch, res_nk)
+                for t in target_non_key:
+                    eval_img_ids_nk.add(int(t['image_id'].item()))
+            
+            cycle_step += 1
 
     # Calculate Averages
     avg_k_time = (metrics['k_time'] / metrics['k_frames']) * 1000 if metrics['k_frames'] else 0
@@ -290,6 +335,7 @@ def main():
 
     key_scale = args.key_score_scale
     nonkey_scale = args.nonkey_score_scale
+    combined_img_ids = eval_img_ids_key | eval_img_ids_nk
 
     if args.tune_score_scales:
         grid = parse_scale_grid(args.score_scale_grid)
@@ -300,11 +346,10 @@ def main():
                 scaled_nk = scale_results(res_nk, ns)
                 
                 # Filter out overlapping image IDs from non-key results
-                key_img_ids = set([det['image_id'] for det in scaled_key])
-                filtered_nk = [det for det in scaled_nk if det['image_id'] not in key_img_ids]
+                filtered_nk = [det for det in scaled_nk if det['image_id'] not in eval_img_ids_key]
                 
                 combined_map_tmp, combined_map50_tmp = evaluate_map(
-                    coco_gt, scaled_key + filtered_nk, "COMBINED OVERALL AVERAGE"
+                    coco_gt, scaled_key + filtered_nk, "COMBINED OVERALL AVERAGE", combined_img_ids
                 )
                 score = (combined_map_tmp, combined_map50_tmp)
                 if best is None or score > best['score']:
@@ -323,16 +368,15 @@ def main():
     scaled_res_nk = scale_results(res_nk, nonkey_scale)
     
     # Filter out overlapping image IDs from non-key results for final combined metric
-    final_key_img_ids = set([det['image_id'] for det in scaled_res_key])
-    final_filtered_nk = [det for det in scaled_res_nk if det['image_id'] not in final_key_img_ids]
+    final_filtered_nk = [det for det in scaled_res_nk if det['image_id'] not in eval_img_ids_key]
     scaled_combined = scaled_res_key + final_filtered_nk
 
-    map_k, map50_k = evaluate_map(coco_gt, scaled_res_key, "HEAVY KEY MODEL ONLY")
-    map_nk, map50_nk = evaluate_map(coco_gt, scaled_res_nk, "LIGHTWEIGHT NON-KEY MODEL ONLY")
-    combined_map, combined_map50 = evaluate_map(coco_gt, scaled_combined, "COMBINED OVERALL AVERAGE")
+    map_k, map50_k = evaluate_map(coco_gt, scaled_res_key, "HEAVY KEY MODEL ONLY", eval_img_ids_key)
+    map_nk, map50_nk = evaluate_map(coco_gt, scaled_res_nk, "LIGHTWEIGHT NON-KEY MODEL ONLY", eval_img_ids_nk)
+    combined_map, combined_map50 = evaluate_map(coco_gt, scaled_combined, "COMBINED OVERALL AVERAGE", combined_img_ids)
 
     print("\n" + "="*70)
-    print(f"FINAL SUMMARY (Level {args.nk_per_key})")
+    print(f"FINAL SUMMARY (Level {args.nk_per_key} | Stride {cycle_len})")
     print("="*70)
     print(f"Score scales -> key: {key_scale:.3f}, non-key: {nonkey_scale:.3f}")
     print(f"Key      mAP: {map_k:.4f} | mAP50: {map50_k:.4f}")

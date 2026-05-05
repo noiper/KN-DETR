@@ -6,6 +6,7 @@ KD only run with: python rtdetrv2_pytorch/tools/phase1_training_v2.py -c rtdetrv
 
 import os 
 import sys
+import hashlib
 
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
@@ -15,7 +16,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import argparse
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 from src.core._config import BaseConfig
 
@@ -25,6 +26,68 @@ from pycocotools.cocoeval import COCOeval
 
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
+
+KEY_PATH_PREFIXES = ('backbone.', 'encoder.', 'decoder.')
+NON_KEY_HEAD_PREFIXES = (
+    'lightweight_decoder.dec_score_head',
+    'lightweight_decoder.dec_bbox_head',
+    'lightweight_decoder.query_pos_head',
+)
+
+
+def _state_fingerprint(state_dict: Dict[str, torch.Tensor], prefixes: Tuple[str, ...]) -> Dict[str, object]:
+    hasher = hashlib.sha256()
+    matched_keys = sorted(k for k in state_dict.keys() if k.startswith(prefixes))
+    for key in matched_keys:
+        tensor = state_dict[key]
+        if not torch.is_tensor(tensor):
+            continue
+        hasher.update(key.encode('utf-8'))
+        hasher.update(str(tuple(tensor.shape)).encode('utf-8'))
+        hasher.update(str(tensor.dtype).encode('utf-8'))
+        hasher.update(tensor.detach().cpu().contiguous().numpy().tobytes())
+    return {
+        'matched_keys': len(matched_keys),
+        'sha256': hasher.hexdigest(),
+    }
+
+
+def _compare_prefixed_state_dicts(
+    source_state: Dict[str, torch.Tensor],
+    loaded_state: Dict[str, torch.Tensor],
+    prefixes: Tuple[str, ...],
+) -> Dict[str, object]:
+    source_keys = sorted(k for k in source_state.keys() if k.startswith(prefixes))
+    missing_in_loaded = []
+    mismatched = []
+    max_abs_diff = 0.0
+
+    for key in source_keys:
+        if key not in loaded_state:
+            missing_in_loaded.append(key)
+            continue
+
+        src_tensor = source_state[key]
+        loaded_tensor = loaded_state[key]
+
+        if src_tensor.shape != loaded_tensor.shape:
+            mismatched.append((key, 'shape_mismatch'))
+            continue
+
+        if not torch.equal(src_tensor, loaded_tensor):
+            if src_tensor.dtype.is_floating_point and loaded_tensor.dtype.is_floating_point:
+                diff = (src_tensor.detach().cpu() - loaded_tensor.detach().cpu()).abs().max().item()
+                max_abs_diff = max(max_abs_diff, diff)
+                mismatched.append((key, f'max_abs_diff={diff:.6g}'))
+            else:
+                mismatched.append((key, 'value_mismatch'))
+
+    return {
+        'source_prefixed_keys': len(source_keys),
+        'missing_in_loaded': missing_in_loaded,
+        'mismatched': mismatched,
+        'max_abs_diff': max_abs_diff,
+    }
 
 class Phase1Trainer:
     """
@@ -54,6 +117,7 @@ class Phase1Trainer:
         training_strategy: str = 'joint',
         same_frame: bool = False,
         reuse_match_indices: bool = False,
+        provenance: Optional[Dict[str, object]] = None,
     ):
         self.model = model
         self.criterion = criterion
@@ -70,6 +134,7 @@ class Phase1Trainer:
         self.training_strategy = training_strategy
         self.same_frame = same_frame
         self.reuse_match_indices = reuse_match_indices
+        self.provenance = provenance or {}
         
         valid_strategies = ['kd', 'kd_only', 'decoder_only', 'freeze_key', 'joint']
         if self.training_strategy not in valid_strategies:
@@ -346,6 +411,8 @@ class Phase1Trainer:
         for target, output in zip(targets, outputs):
             image_id = int(target['image_id'].item())
             if eval_img_ids is not None:
+                if image_id in eval_img_ids:
+                    continue # Skip duplicates to prevent mAP inflation
                 eval_img_ids.add(image_id)
             boxes = output['boxes'].cpu().numpy()
             scores = output['scores'].cpu().numpy()
@@ -395,6 +462,7 @@ class Phase1Trainer:
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'metrics': metrics,
+            'provenance': self.provenance,
         }
         
         map5095 = metrics.get('non_key_mAP', 0.0)
@@ -503,6 +571,8 @@ def main():
                        help='Skip training and only run evaluation on the provided weights')
     parser.add_argument('--eval_before_train', action='store_true',
                        help='Run one validation pass before the first training epoch')
+    parser.add_argument('--verify_pretrained_only', action='store_true',
+                       help='Verify pretrained load integrity, run one evaluation pass, then exit')
     parser.add_argument('--same_frame', action='store_true',
                        help='Diagnostic: Force non-key frame to be identical to key frame')
     parser.add_argument('--init_weights', action='store_true', 
@@ -537,18 +607,64 @@ def main():
         model, cfg = build_model_from_config(args.config, device)
 
         is_temporal = False
+        pretrained_metadata = {
+            'pretrained_path': args.pretrained,
+            'checkpoint_type': 'none',
+            'state_fingerprint': None,
+            'load_integrity': None,
+        }
         if args.pretrained:
             print(f"\n=> Inspecting weights from: {args.pretrained}")
             checkpoint = torch.load(args.pretrained, map_location=device, weights_only=False)
             state_dict = checkpoint.get('model_state_dict', checkpoint.get('model', checkpoint))
             is_temporal = any('fusion_blocks' in k for k in state_dict.keys())
+            source_fp = _state_fingerprint(state_dict, KEY_PATH_PREFIXES)
+            print(f"   Source key-path fingerprint: {source_fp['sha256'][:16]} ({source_fp['matched_keys']} tensors)")
             
             if is_temporal:
                 print("   [Auto-Detect] Full Temporal weights found. Loading strictly...")
+                has_non_key_prediction_heads = any(k.startswith(NON_KEY_HEAD_PREFIXES) for k in state_dict.keys())
+                if has_non_key_prediction_heads and hasattr(model, 'lightweight_decoder') and model.lightweight_decoder is not None:
+                    model.decouple_non_key_prediction_heads()
+                    print("   [Safety] Decoupled non-key prediction heads before strict temporal load.")
                 model.load_state_dict(state_dict, strict=True)
+                load_report = _compare_prefixed_state_dicts(
+                    state_dict, model.state_dict(), KEY_PATH_PREFIXES
+                )
+                if load_report['missing_in_loaded'] or load_report['mismatched']:
+                    details = load_report['mismatched'][:5]
+                    raise RuntimeError(
+                        "Key-path integrity check failed after strict temporal load. "
+                        f"missing={len(load_report['missing_in_loaded'])}, "
+                        f"mismatched={len(load_report['mismatched'])}, "
+                        f"sample={details}"
+                    )
+                print("   [Integrity] Key-path tensors match source checkpoint.")
+                pretrained_metadata['checkpoint_type'] = 'temporal'
             else:
                 print("   [Auto-Detect] Standard Key-Frame weights found. Warm-starting...")
                 model.load_state_dict(state_dict, strict=False)
+                load_report = _compare_prefixed_state_dicts(
+                    state_dict, model.state_dict(), KEY_PATH_PREFIXES
+                )
+                print(
+                    "   [Integrity] Warm-start key-path report: "
+                    f"missing={len(load_report['missing_in_loaded'])}, "
+                    f"mismatched={len(load_report['mismatched'])}, "
+                    f"max_abs_diff={load_report['max_abs_diff']:.6g}"
+                )
+                pretrained_metadata['checkpoint_type'] = 'key_only_or_partial'
+
+            loaded_fp = _state_fingerprint(model.state_dict(), KEY_PATH_PREFIXES)
+            pretrained_metadata['state_fingerprint'] = {
+                'source_key_path': source_fp,
+                'loaded_key_path': loaded_fp,
+            }
+            pretrained_metadata['load_integrity'] = {
+                'missing_in_loaded': len(load_report['missing_in_loaded']),
+                'mismatched': len(load_report['mismatched']),
+                'max_abs_diff': load_report['max_abs_diff'],
+            }
             print("   Success!")
 
         if args.init_weights:
@@ -697,7 +813,24 @@ def main():
         training_strategy=args.training_strategy,
         same_frame=args.same_frame,
         reuse_match_indices=args.reuse_match_indices,
+        provenance=pretrained_metadata,
     )
+
+    if args.verify_pretrained_only:
+        print("\n" + "="*80)
+        print("Executing PRETRAINED VERIFICATION ONLY Mode...")
+        print("="*80)
+        if not args.pretrained:
+            print("❌ Error: --verify_pretrained_only requires --pretrained.")
+            sys.exit(1)
+        if val_dataloader is None:
+            print("⚠️ Warning: No validation dataloader found. Load integrity check already completed.")
+            return
+        verify_stats = trainer.evaluate(val_dataloader, epoch=0)
+        print("\nVerification Evaluation Stats:")
+        for k, v in verify_stats.items():
+            print(f"  {k}: {v:.4f}")
+        return
     
     if args.eval_only:
         print("\n" + "="*80)

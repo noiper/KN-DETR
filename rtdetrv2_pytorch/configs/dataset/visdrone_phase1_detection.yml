@@ -14,7 +14,7 @@ train_dataloader:
     root_dir: ../dataset/VisDrone/VisDrone2019-VID-train/sequences/
     ann_file: ../dataset/VisDrone/train.json
     max_frame_gap: 1
-    pair_sampling_strategy: "random_single"
+    pair_sampling_strategy: "random"
     frame_stride: 1
     transforms:
       type: Compose
@@ -49,7 +49,7 @@ val_dataloader:
     root_dir: ../dataset/VisDrone/VisDrone2019-VID-val/sequences/
     ann_file: ../dataset/VisDrone/val.json
     max_frame_gap: 1
-    # pair_sampling_strategy: "random_single"
+    # pair_sampling_strategy: "random"
     # frame_stride: 1
     pair_sampling_strategy: "fixed_gap"
     frame_stride: 2
