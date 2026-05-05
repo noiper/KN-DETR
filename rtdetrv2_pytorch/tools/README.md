@@ -79,16 +79,29 @@ For tasks like exporting or running inference, which don't need to run for days,
 *   **Step 3.2: Run Export or Inference Commands**
     Now, inside this new shell, run your commands.
     ```bash
-    # Export to ONNX
+    # Export temporal model to two ONNX graphs:
+    #   1) Key model: emits detections + cached encoder features
+    #   2) Non-key model: consumes cached encoder features + emits detections
     python tools/export_onnx.py \
-        -c configs/rtdetr/rtdetr_r50vd_6x_coco.yml \
-        -r path/to/trained_checkpoint.pth \
-        --check
-    ```
-    
-    ```
-    # Convert to TensorRT
-    bash tools/onnx2trt.sh /path/to/your/model.onnx
+        -c configs/rtdetrv2/phase1_virat_r18vd.yml \
+        -r path/to/temporal_checkpoint.pth \
+        -s 640 \
+        --key_onnx key_model.onnx \
+        --nonkey_onnx nonkey_model.onnx
+
+    # Convert key ONNX to TensorRT
+    python tools/export_trt.py \
+        -i key_model.onnx \
+        -o key_model.trt \
+        -m key \
+        --fp16
+
+    # Convert non-key ONNX to TensorRT
+    python tools/export_trt.py \
+        -i nonkey_model.onnx \
+        -o nonkey_model.trt \
+        -m nonkey \
+        --fp16
     ```
 
     ```

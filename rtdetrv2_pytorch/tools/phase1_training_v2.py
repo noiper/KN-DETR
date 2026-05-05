@@ -298,6 +298,8 @@ class Phase1Trainer:
 
         results_key = []
         results_non_key = []
+        eval_img_ids_key = set()
+        eval_img_ids_non_key = set()
         
         for batch_idx, (img_key, target_key, img_non_key, target_non_key) in enumerate(val_dataloader):
             if self.same_frame:
@@ -309,7 +311,7 @@ class Phase1Trainer:
             outputs_key = self.model.forward_key_frame(img_key, None)
             orig_sizes_k = torch.stack([t["orig_size"] for t in target_key], dim=0).to(self.device)
             res_key = self.postprocessor(outputs_key, orig_sizes_k)
-            self._accumulate(results_key, target_key, res_key)
+            self._accumulate(results_key, target_key, res_key, eval_img_ids_key)
             # --- NON-KEY FRAME ---
             if isinstance(img_non_key, torch.Tensor):
                 img_non_key = img_non_key.to(self.device)
@@ -317,18 +319,18 @@ class Phase1Trainer:
             outputs_nk = self.model.forward_non_key_frame(img_non_key, None)
             orig_sizes_nk = torch.stack([t["orig_size"] for t in target_non_key], dim=0).to(self.device)
             res_nk = self.postprocessor(outputs_nk, orig_sizes_nk)
-            self._accumulate(results_non_key, target_non_key, res_nk)
+            self._accumulate(results_non_key, target_non_key, res_nk, eval_img_ids_non_key)
             
             if batch_idx % 100 == 0:
                 print(f"  Processed {batch_idx}/{len(val_dataloader)} batches")
 
         stats = {}
         print("\n>>> KEY FRAME RESULTS:")
-        k_stats = self._run_coco_eval(coco_gt, results_key)
+        k_stats = self._run_coco_eval(coco_gt, results_key, eval_img_ids_key)
         stats.update({f'key_{k}': v for k, v in k_stats.items()})
         
         print("\n>>> NON-KEY FRAME RESULTS:")
-        nk_stats = self._run_coco_eval(coco_gt, results_non_key)
+        nk_stats = self._run_coco_eval(coco_gt, results_non_key, eval_img_ids_non_key)
         stats.update({f'non_key_{k}': v for k, v in nk_stats.items()})
         print(f"Gap (Key - NonKey) mAP: {k_stats['mAP'] - nk_stats['mAP']:.4f}")
 
@@ -339,10 +341,12 @@ class Phase1Trainer:
         print(f"{'='*80}\n")
         return stats
 
-    def _accumulate(self, results_list, targets, outputs):
+    def _accumulate(self, results_list, targets, outputs, eval_img_ids=None):
         """Helper to convert tensor outputs to COCO list format"""
         for target, output in zip(targets, outputs):
             image_id = int(target['image_id'].item())
+            if eval_img_ids is not None:
+                eval_img_ids.add(image_id)
             boxes = output['boxes'].cpu().numpy()
             scores = output['scores'].cpu().numpy()
             labels = output['labels'].cpu().numpy()
@@ -357,7 +361,7 @@ class Phase1Trainer:
                     "score": float(scores[i])
                 })
 
-    def _run_coco_eval(self, coco_gt, results_list):
+    def _run_coco_eval(self, coco_gt, results_list, eval_img_ids=None):
         """Helper to run COCOeval on a list of results"""
         import gc
         if not results_list:
@@ -366,6 +370,8 @@ class Phase1Trainer:
         coco_dt = coco_gt.loadRes(results_list)
         
         coco_eval = COCOeval(coco_gt, coco_dt, 'bbox')
+        if eval_img_ids is not None:
+            coco_eval.params.imgIds = sorted(eval_img_ids)
         coco_eval.evaluate()
         coco_eval.accumulate()
         coco_eval.summarize()
