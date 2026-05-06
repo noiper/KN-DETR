@@ -242,18 +242,22 @@ class TemporalRTDETR(nn.Module):
         print(f"  - Use lightweight decoder: {use_lightweight_decoder}")
         print(f"  - Reuse position: {self.reuse_position}")
     
-    def forward_key_frame(self, img: torch.Tensor, targets: Optional[List[Dict]] = None) -> Tuple:
+    def forward_key_frame(
+        self,
+        img: torch.Tensor,
+        targets: Optional[List[Dict]] = None,
+        return_backbone_s5: bool = False,
+    ) -> Tuple:
         """
         Forward key frame through full pipeline and cache features
         
         Args:
             img: Key frame image [B, C, H, W]
             targets: Ground truth annotations
+            return_backbone_s5: If True, also return raw backbone S5 [B, 512, H/32, W/32]
         
         Returns:
-            outputs: Detection outputs
-            ccff_features: Cached multi-scale features
-            query_embeddings: Cached query embeddings (optional)
+            outputs: Detection outputs, or (outputs, backbone_s5) when return_backbone_s5=True
         """
         backbone_features = self.backbone(img)
         c3, c4, c5 = backbone_features[-3:]
@@ -271,12 +275,20 @@ class TemporalRTDETR(nn.Module):
         self.cached_content = cached_content[:, :self.num_queries, :].detach()
         self.cached_points_unact = cached_points_unact[:, :self.num_queries, :].detach()
         
+        if return_backbone_s5:
+            return outputs, c5
         return outputs
     
-    def forward_non_key_frame(self, img: torch.Tensor, targets: Optional[List[Dict]] = None, return_fused: bool = False,
-                              cached_ccff: Optional[List[torch.Tensor]] = None,
-                              cached_content: Optional[torch.Tensor] = None,
-                              cached_points_unact: Optional[torch.Tensor] = None) -> Dict:
+    def forward_non_key_frame(
+        self,
+        img: torch.Tensor,
+        targets: Optional[List[Dict]] = None,
+        return_fused: bool = False,
+        cached_ccff: Optional[List[torch.Tensor]] = None,
+        cached_content: Optional[torch.Tensor] = None,
+        cached_points_unact: Optional[torch.Tensor] = None,
+        return_backbone_s5: bool = False,
+    ) -> Dict:
         """
         Forward non-key frame through lightweight pipeline with fusion
         
@@ -287,6 +299,7 @@ class TemporalRTDETR(nn.Module):
             cached_ccff: Optional cached multi-scale features (for ONNX export)
             cached_content: Optional cached query content (for ONNX export)
             cached_points_unact: Optional cached reference points (for ONNX export)
+            return_backbone_s5: Whether to also return raw non-key S5 [B, 512, H/32, W/32]
         
         Returns:
             outputs: Detection outputs
@@ -329,8 +342,12 @@ class TemporalRTDETR(nn.Module):
             # Use full decoder
             outputs = self.decoder(decoder_input, targets=targets)
 
+        if return_fused and return_backbone_s5:
+            return outputs, fused_features, s5
         if return_fused:
             return outputs, fused_features
+        if return_backbone_s5:
+            return outputs, s5
         return outputs
 
     def deploy(self):

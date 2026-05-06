@@ -39,7 +39,7 @@ train_dataloader:
   collate_fn:
     type: TemporalBatchCollateFunction
     scales: [480, 512, 544, 576, 608, 640, 640, 640, 672, 704, 736, 768, 800]
-    stop_epoch: 7
+    stop_epoch: 4
 
 
 val_dataloader:
