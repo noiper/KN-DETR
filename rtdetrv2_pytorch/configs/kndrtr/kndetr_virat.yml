@@ -1,13 +1,13 @@
 __include__: [
   '../dataset/virat_detection.yml',
   '../runtime.yml',
-  './include/dataloader.yml',
-  './include/optimizer.yml',
-  './include/rtdetrv2_r50vd.yml',
+  '../rtdetrv2/include/dataloader.yml',
+  '../rtdetrv2/include/optimizer.yml',
+  '../rtdetrv2/include/rtdetrv2_r50vd.yml',
 ]
 
-tuning: ./rtdetrv2_r18vd_120e_coco.pth
-output_dir: ./output/rtdetrv2_r18vd_virat
+tuning: ./models/rtdetrv2_r18vd_120e_coco.pth
+output_dir: ./output/kndetr_virat
 
 num_classes: 2
 

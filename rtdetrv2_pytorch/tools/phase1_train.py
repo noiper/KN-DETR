@@ -562,11 +562,11 @@ def main():
     parser = argparse.ArgumentParser()
     
     parser.add_argument('--config', '-c', type=str, required=True)
-    parser.add_argument('--training_strategy', type=str, default='freeze_key',
+    parser.add_argument('--training_strategy', '-s', type=str, default='freeze_key',
                         choices=['freeze_key', 'joint', 'kd', 'kd_only', 'decoder_only'],
                         help='freeze_key, joint, kd, kd_only, or decoder_only')
-    parser.add_argument('--pretrained', type=str, default=None,
-                       help='Path to checkpoint (auto-detects key-only vs full temporal)')
+    parser.add_argument('--tuning', '-t', type=str, default=None,
+                       help='Tuning from checkpoint (auto-detects key-only vs full temporal)')
     parser.add_argument('--eval_only', action='store_true',
                        help='Skip training and only run evaluation on the provided weights')
     parser.add_argument('--eval_before_train', action='store_true',
@@ -608,14 +608,14 @@ def main():
 
         is_temporal = False
         pretrained_metadata = {
-            'pretrained_path': args.pretrained,
+            'pretrained_path': args.tuning,
             'checkpoint_type': 'none',
             'state_fingerprint': None,
             'load_integrity': None,
         }
-        if args.pretrained:
-            print(f"\n=> Inspecting weights from: {args.pretrained}")
-            checkpoint = torch.load(args.pretrained, map_location=device, weights_only=False)
+        if args.tuning:
+            print(f"\n=> Inspecting weights from: {args.tuning}")
+            checkpoint = torch.load(args.tuning, map_location=device, weights_only=False)
             state_dict = checkpoint.get('model_state_dict', checkpoint.get('model', checkpoint))
             is_temporal = any('fusion_blocks' in k for k in state_dict.keys())
             source_fp = _state_fingerprint(state_dict, KEY_PATH_PREFIXES)
@@ -820,8 +820,8 @@ def main():
         print("\n" + "="*80)
         print("Executing PRETRAINED VERIFICATION ONLY Mode...")
         print("="*80)
-        if not args.pretrained:
-            print("❌ Error: --verify_pretrained_only requires --pretrained.")
+        if not args.tuning:
+            print("❌ Error: --verify_pretrained_only requires --tuning.")
             sys.exit(1)
         if val_dataloader is None:
             print("⚠️ Warning: No validation dataloader found. Load integrity check already completed.")

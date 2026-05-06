@@ -1,9 +1,9 @@
 # Phase 1 Temporal RT-DETR Training Configuration for VIRAT Dataset
 
 __include__: [
-  '../dataset/virat_phase1_detection.yml',
-  './include/optimizer.yml',
-  './include/rtdetrv2_r50vd.yml',  # Include R50 base, then override to R18
+  '../dataset/virat_temporal_detection.yml',
+  '../rtdetrv2/include/optimizer.yml',
+  '../rtdetrv2/include/rtdetrv2_r50vd.yml',  # Include R50 base, then override to R18
 ]
 
 # Override output directory
