@@ -116,23 +116,23 @@ def extract_video_id(file_name):
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Temporal RT-DETR in Real-Time Simulation")
-    parser.add_argument('-c', '--config', type=str, required=True, help='Path to config yml')
-    parser.add_argument('-w', '--weights', type=str, required=True, help='Path to checkpoint .pth file')
+    parser.add_argument('--config', '-c', type=str, required=True, help='Path to config yml')
+    parser.add_argument('--weights','-w',  type=str, required=True, help='Path to checkpoint .pth file')
     parser.add_argument('--warmup', type=int, default=10, help='Ignore first N batches for timing/memory')
-    parser.add_argument('--nk_per_key', type=int, default=1, 
+    parser.add_argument('--nk_per_key', '-n', type=int, default=1, 
                         help='Number of Non-Key frames per Key frame. 1 = (K, NK), 2 = (K, NK, NK), etc.')
-    parser.add_argument('--frame_stride', type=int, default=1,
+    parser.add_argument('--frame_stride', '-f', type=int, default=1,
                         help='Stride between Key sequences. Overrides YAML config for clean usage.')
     parser.add_argument('--baseline', action='store_true',
                         help='Baseline: reuse key-frame detections directly for non-key frames')
-    parser.add_argument('--key_score_scale', type=float, default=1.0,
+    parser.add_argument('--key_score', '-ks', type=float, default=1.0,
                         help='Multiply key-path confidence scores by this factor before evaluation')
-    parser.add_argument('--nonkey_score_scale', type=float, default=1.0,
+    parser.add_argument('--nonkey_score', '-ns', type=float, default=1.0,
                         help='Multiply non-key-path confidence scores by this factor before evaluation')
-    parser.add_argument('--tune_score_scales', action='store_true',
+    parser.add_argument('--tune_score', '-ts', action='store_true',
                         help='Grid search key/non-key score scales for best combined mAP')
-    parser.add_argument('--score_scale_grid', type=str, default='0.8,0.9,1.0,1.1,1.2',
-                        help='Comma-separated scale grid for --tune_score_scales')
+    parser.add_argument('--score_grid', type=str, default='0.8,0.9,1.0,1.1,1.2',
+                        help='Comma-separated scale grid for --tune_score')
     args = parser.parse_args()
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -333,12 +333,12 @@ def main():
     avg_k_mem = (metrics['k_mem'] / metrics['k_frames']) if metrics['k_frames'] > 0 else 0
     avg_nk_mem = (metrics['nk_mem'] / metrics['nk_frames']) if metrics['nk_frames'] > 0 else 0
 
-    key_scale = args.key_score_scale
-    nonkey_scale = args.nonkey_score_scale
+    key_scale = args.key_score
+    nonkey_scale = args.nonkey_score
     combined_img_ids = eval_img_ids_key | eval_img_ids_nk
 
-    if args.tune_score_scales:
-        grid = parse_scale_grid(args.score_scale_grid)
+    if args.tune_score:
+        grid = parse_scale_grid(args.score_grid)
         best = None
         for ks in grid:
             for ns in grid:
