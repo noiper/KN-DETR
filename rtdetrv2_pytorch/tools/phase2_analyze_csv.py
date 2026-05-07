@@ -89,67 +89,91 @@ def main():
     if not rows:
         raise RuntimeError(f"CSV has no rows: {csv_path}")
 
-    cosine = np.array([_to_float(r.get("cosine_s5_prev_non_key")) for r in rows], dtype=np.float64)
-    l1 = np.array([_to_float(r.get("l1_s5_prev_non_key")) for r in rows], dtype=np.float64)
+    # Standardized metrics aligned with phase2_generate_csv.py
+    metrics_to_analyze = [
+        "frame_gap",
+        "cosine_s5_prev",
+        "l1_s5_prev",
+        "max_abs_diff_s5_prev",
+        "smoothed_max_diff_s5_prev",
+        "topk_mean_diff_s5_prev",
+        "cosine_s5_anchor",
+        "l1_s5_anchor",
+        "max_abs_diff_s5_anchor",
+        "smoothed_max_diff_s5_anchor",
+        "topk_mean_diff_s5_anchor",
+    ]
+
     score_gap = np.array([_to_float(r.get("oracle_minus_student_mean_score")) for r in rows], dtype=np.float64)
-    det_gap = np.array([_to_float(r.get("oracle_minus_student_det_count")) for r in rows], dtype=np.float64)
+    if not np.any(np.isfinite(score_gap)):
+        # Fallback to map_gap if score_gap is missing
+        score_gap = np.array([_to_float(r.get("map_gap")) for r in rows], dtype=np.float64)
 
     global_map_gap = _to_float(rows[0].get("avg_map_gap"))
-    global_map50_gap = _to_float(rows[0].get("avg_map50_gap"))
-
-    x1, y1 = _valid_pairs(cosine, score_gap)
-    x2, y2 = _valid_pairs(cosine, det_gap)
-    x3, y3 = _valid_pairs(l1, score_gap)
-    x4, y4 = _valid_pairs(l1, det_gap)
+    if math.isnan(global_map_gap):
+        # Calculate from per-frame map_gap column if global is missing
+        all_m_gaps = [_to_float(r.get("map_gap")) for r in rows]
+        valid_m_gaps = [v for v in all_m_gaps if not math.isnan(v)]
+        global_map_gap = sum(valid_m_gaps) / len(valid_m_gaps) if valid_m_gaps else float("nan")
 
     report = {
         "num_rows": len(rows),
-        "num_valid_cosine_score_gap": int(x1.size),
-        "num_valid_cosine_det_gap": int(x2.size),
         "global_avg_map_gap": global_map_gap,
-        "global_avg_map50_gap": global_map50_gap,
-        "metrics": {
-            "cosine_vs_score_gap": {
-                "pearson": _pearson(x1, y1),
-                "spearman": _spearman(x1, y1),
-                "linear_fit": _linear_fit(x1, y1),
-            },
-            "cosine_vs_det_gap": {
-                "pearson": _pearson(x2, y2),
-                "spearman": _spearman(x2, y2),
-                "linear_fit": _linear_fit(x2, y2),
-            },
-            "l1_vs_score_gap": {
-                "pearson": _pearson(x3, y3),
-                "spearman": _spearman(x3, y3),
-                "linear_fit": _linear_fit(x3, y3),
-            },
-            "l1_vs_det_gap": {
-                "pearson": _pearson(x4, y4),
-                "spearman": _spearman(x4, y4),
-                "linear_fit": _linear_fit(x4, y4),
-            },
-        },
+        "metrics": {},
     }
+
+    # Classification proxy: "High Gap" = top 25% of absolute errors
+    abs_err = np.abs(score_gap)
+    valid_abs_err = abs_err[np.isfinite(abs_err)]
+    if valid_abs_err.size > 0:
+        high_gap_threshold = np.percentile(valid_abs_err, 75)
+        is_high_gap = abs_err > high_gap_threshold
+    else:
+        is_high_gap = np.zeros_like(score_gap, dtype=bool)
+
+    for m_name in metrics_to_analyze:
+        signal = np.array([_to_float(r.get(m_name)) for r in rows], dtype=np.float64)
+        x, y = _valid_pairs(signal, score_gap)
+        
+        # Separation analysis
+        mask = np.isfinite(signal) & np.isfinite(score_gap)
+        s_valid = signal[mask]
+        h_valid = is_high_gap[mask]
+        
+        sep_ratio = float("nan")
+        if h_valid.any() and not h_valid.all():
+            mean_high = np.mean(s_valid[h_valid])
+            mean_low = np.mean(s_valid[~h_valid])
+            std_all = np.std(s_valid)
+            if std_all > 0:
+                sep_ratio = abs(mean_high - mean_low) / std_all
+
+        report["metrics"][m_name] = {
+            "pearson": _pearson(x, y),
+            "spearman": _spearman(x, y),
+            "linear_fit": _linear_fit(x, y),
+            "separation_ratio": sep_ratio,
+            "num_valid": int(x.size)
+        }
 
     def _fmt(v: float) -> str:
         return "nan" if (v is None or not math.isfinite(v)) else f"{v:.6f}"
 
     print(f"Rows: {report['num_rows']}")
-    print(f"Global avg mAP gap (oracle-student): {_fmt(report['global_avg_map_gap'])}")
-    print(f"Global avg mAP50 gap (oracle-student): {_fmt(report['global_avg_map50_gap'])}")
-    print(
-        "Cosine vs score-gap | "
-        f"pearson={_fmt(report['metrics']['cosine_vs_score_gap']['pearson'])}, "
-        f"spearman={_fmt(report['metrics']['cosine_vs_score_gap']['spearman'])}, "
-        f"r2={_fmt(report['metrics']['cosine_vs_score_gap']['linear_fit']['r2'])}"
-    )
-    print(
-        "L1 vs score-gap     | "
-        f"pearson={_fmt(report['metrics']['l1_vs_score_gap']['pearson'])}, "
-        f"spearman={_fmt(report['metrics']['l1_vs_score_gap']['spearman'])}, "
-        f"r2={_fmt(report['metrics']['l1_vs_score_gap']['linear_fit']['r2'])}"
-    )
+    print(f"Global avg mAP gap: {_fmt(report['global_avg_map_gap'])}")
+    print("-" * 110)
+    print(f"{'Metric':<35} | {'Pearson':<10} | {'Spearman':<10} | {'SepRatio':<10} | {'R2':<10} | {'Valid'}")
+    print("-" * 110)
+    for m_name in metrics_to_analyze:
+        m_data = report["metrics"][m_name]
+        print(
+            f"{m_name:<35} | "
+            f"{_fmt(m_data['pearson']):<10} | "
+            f"{_fmt(m_data['spearman']):<10} | "
+            f"{_fmt(m_data['separation_ratio']):<10} | "
+            f"{_fmt(m_data['linear_fit']['r2']):<10} | "
+            f"{m_data['num_valid']}"
+        )
 
     if args.out_json is not None:
         out_path = Path(args.out_json)
