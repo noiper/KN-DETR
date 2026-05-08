@@ -160,6 +160,10 @@ cython_debug/
 # Dataset
 datasets/
 
+# Tables and root-level images
+tables/
+/*.png
+
 .DS_Store
 *.ipynb
 *.pth 
