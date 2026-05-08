@@ -536,6 +536,10 @@ def build_model_from_config(config_path: str, device: torch.device):
         num_queries=num_queries,
         use_lightweight_decoder=use_lightweight_decoder,
         reuse_position=reuse_position,
+        enable_apg=cfg.yaml_cfg.get('enable_apg', False),
+        apg_in_channels=cfg.yaml_cfg.get('apg_in_channels', 512),
+        apg_hidden_channels=cfg.yaml_cfg.get('apg_hidden_channels', 64),
+        apg_pool_size=cfg.yaml_cfg.get('apg_pool_size', 4),
     )
     
     return temporal_model, cfg

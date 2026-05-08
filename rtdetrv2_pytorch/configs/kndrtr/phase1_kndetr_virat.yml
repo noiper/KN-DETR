@@ -7,8 +7,8 @@ __include__: [
 ]
 
 # Override output directory
-output_dir: './output/phase1_virat_level1'
-summary_dir: './output/phase1_virat_level1/summary'
+output_dir: './output/phase1_virat_level5'
+summary_dir: './output/phase1_virat_level5/summary'
 
 # Override to ResNet18[]
 PResNet:
@@ -40,13 +40,13 @@ reuse_position: 3             # Reuse query state from key decoder position (0=b
 non_key_decoder_layers: 1       # Number of layers for non-key decoder (1 or 3)
 
 # Training Settings
-epoches: 10
+epoches: 5
 clip_max_norm: 0.1
 
 # Learning Rate Scheduler (override)
 lr_scheduler:
   type: MultiStepLR
-  milestones: [7, 9]
+  milestones: [3, 4]
   gamma: 0.1
 
 # Logging and Checkpointing

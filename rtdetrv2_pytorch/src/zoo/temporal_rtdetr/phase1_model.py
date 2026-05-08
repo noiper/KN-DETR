@@ -180,6 +180,47 @@ class LightweightDecoder(RTDETRTransformerv2):
         
         return out
 
+
+class AdaptivePropagationGate(nn.Module):
+    """Lightweight APG gate for key/non-key routing."""
+
+    def __init__(self, in_channels: int = 512, hidden_channels: int = 64, pool_size: int = 4):
+        super().__init__()
+        self.in_channels = in_channels
+        self.hidden_channels = hidden_channels
+        self.pool_size = int(pool_size)
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.pool = nn.AdaptiveAvgPool2d((self.pool_size, self.pool_size))
+        self.fc = nn.Linear(hidden_channels * self.pool_size * self.pool_size, 1)
+
+    def forward(self, prev_key_s5: torch.Tensor, current_s5: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            prev_key_s5: Previous key S5 feature [B, C, H, W]
+            current_s5: Current frame S5 feature [B, C, H, W]
+
+        Returns:
+            logits: APG logits [B]
+            probs: APG probabilities [B]
+        """
+        # Residual feature: [B, C, H, W]
+        residual = current_s5 - prev_key_s5
+        # APG hidden map: [B, hidden_channels, H, W]
+        hidden = self.conv(residual)
+        # Pooled APG descriptor: [B, hidden_channels, pool_size, pool_size]
+        pooled = self.pool(hidden)
+        # Flattened APG descriptor: [B, hidden_channels * pool_size * pool_size]
+        flattened = pooled.flatten(1)
+        logits = self.fc(flattened).squeeze(-1)
+        probs = torch.sigmoid(logits)
+        return logits, probs
+
+
 class TemporalRTDETR(nn.Module):
     """
     Temporal RT-DETR for Phase 1 training
@@ -196,6 +237,10 @@ class TemporalRTDETR(nn.Module):
         num_queries: int = 300,
         use_lightweight_decoder: bool = True,
         reuse_position: int = 0,
+        enable_apg: bool = False,
+        apg_in_channels: int = 512,
+        apg_hidden_channels: int = 64,
+        apg_pool_size: int = 4,
     ):
         super().__init__()
         
@@ -207,6 +252,7 @@ class TemporalRTDETR(nn.Module):
         self.num_queries = num_queries
         self.use_lightweight_decoder = use_lightweight_decoder
         self.reuse_position = int(reuse_position)
+        self.enable_apg = bool(enable_apg)
         self.decoder_num_layers = getattr(getattr(decoder, 'decoder', None), 'num_layers', None)
         if self.reuse_position < 0:
             raise ValueError(f"reuse_position must be >= 0, but got {self.reuse_position}")
@@ -220,6 +266,7 @@ class TemporalRTDETR(nn.Module):
         self.cached_ccff = None
         self.cached_content = None
         self.cached_points_unact = None
+        self.cached_key_s5 = None
 
         device = next(decoder.parameters()).device
 
@@ -237,6 +284,14 @@ class TemporalRTDETR(nn.Module):
             )
         else:
             self.lightweight_decoder = None
+
+        self.apg = None
+        if self.enable_apg:
+            self.apg = AdaptivePropagationGate(
+                in_channels=apg_in_channels,
+                hidden_channels=apg_hidden_channels,
+                pool_size=apg_pool_size,
+            )
         
         print(f"  Success!")
         print(f"  - Use lightweight decoder: {use_lightweight_decoder}")
@@ -259,6 +314,7 @@ class TemporalRTDETR(nn.Module):
         c3, c4, c5 = backbone_features[-3:]
         encoder_output = self.encoder([c3, c4, c5])
         self.cached_ccff = [feat.detach() for feat in encoder_output]
+        self.cached_key_s5 = c5.detach()
         outputs, cached_query_states = self.decoder(encoder_output, return_query=True, targets=targets)
 
         if self.reuse_position >= len(cached_query_states):
@@ -333,6 +389,23 @@ class TemporalRTDETR(nn.Module):
             return outputs, fused_features
         return outputs
 
+    def extract_s5(self, img: torch.Tensor) -> torch.Tensor:
+        """
+        Extract raw S5 feature from backbone.
+
+        Args:
+            img: Input image [B, C, H, W]
+        Returns:
+            s5: Backbone S5 feature [B, C5, H5, W5]
+        """
+        backbone_features = self.backbone(img)
+        return backbone_features[-1]
+
+    def forward_apg(self, prev_key_s5: torch.Tensor, current_s5: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.apg is None:
+            raise RuntimeError("APG is disabled. Set enable_apg=True in model config to use forward_apg.")
+        return self.apg(prev_key_s5, current_s5)
+
     def deploy(self):
         self.eval()
         for m in self.modules():
@@ -389,6 +462,10 @@ def build_temporal_rtdetr(cfg):
         num_queries=cfg.num_queries,
         use_lightweight_decoder=cfg.get('use_lightweight_decoder', True),
         reuse_position=cfg.get('reuse_position', 0),
+        enable_apg=cfg.get('enable_apg', False),
+        apg_in_channels=cfg.get('apg_in_channels', 512),
+        apg_hidden_channels=cfg.get('apg_hidden_channels', 64),
+        apg_pool_size=cfg.get('apg_pool_size', 4),
     )
     
     return model

@@ -1,0 +1,22 @@
+# Phase 2 APG Training Configuration (MOT17)
+
+__include__: [
+  './phase1_kndetr_mot17.yml',
+]
+
+output_dir: './output/phase2_apg_mot17_level4'
+summary_dir: './output/phase2_apg_mot17/summary'
+
+# Enable APG module in TemporalRTDETR
+enable_apg: True
+apg_in_channels: 512
+apg_hidden_channels: 64
+apg_pool_size: 4
+
+# APG training hyperparameters
+apg_epochs: 5
+apg_lr: 0.0001
+apg_beta: 1.5
+apg_sampled_keys: 10
+
+seed: 42
