@@ -1,7 +1,5 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
+# Analysis Plots
+plots/
 
 # C extensions
 *.so
@@ -161,6 +159,10 @@ cython_debug/
 
 # Dataset
 datasets/
+
+# Tables and root-level images
+tables/
+/*.png
 
 .DS_Store
 *.ipynb
