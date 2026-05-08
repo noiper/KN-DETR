@@ -224,9 +224,9 @@ def main():
         'nk_time': 0.0, 'nk_mem': 0.0, 'nk_frames': 0
     }
 
-    # The length of one full cycle (e.g., K-NK-NK has a cycle length of 3)
-    # If frame_stride is larger than the sequence length, we skip frames between sequences.
-    cycle_len = max(args.frame_stride, args.nk_per_key + 1)
+    # Period of one full K-NK cycle.
+    # We use args.frame_stride as the cycle length to allow overlapping sequences if stride < nk_per_key + 1.
+    cycle_len = max(args.frame_stride, 1)
     cycle_step = 0
     last_video_id = None
 
@@ -248,8 +248,10 @@ def main():
             # Determine where we are in the K-NK cycle
             step = cycle_step % cycle_len
             
-            if step >= args.nk_per_key:
-                # SKIP BATCH: Either the next cycle's overlapping frame, or we are in the inter-sequence stride gap.
+            # The Key frame batch (step 0) must always be processed if we want a Key frame.
+            # Non-Key steps (>0) are only processed if we haven't reached nk_per_key yet.
+            if step > 0 and step >= args.nk_per_key:
+                # SKIP BATCH: We are in the inter-sequence stride gap.
                 cycle_step += 1
                 continue
             
