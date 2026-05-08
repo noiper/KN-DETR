@@ -164,6 +164,11 @@ datasets/
 tables/
 /*.png
 
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
 .DS_Store
 *.ipynb
 *.pth 
