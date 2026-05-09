@@ -4,7 +4,7 @@ __include__: [
   './phase1_kndetr_mot17.yml',
 ]
 
-output_dir: './output/phase2_apg_mot17_level4'
+output_dir: './output/phase2_apg_mot17_level10'
 summary_dir: './output/phase2_apg_mot17/summary'
 
 # Enable APG module in TemporalRTDETR
@@ -18,5 +18,7 @@ apg_epochs: 5
 apg_lr: 0.0001
 apg_beta: 1.5
 apg_sampled_keys: 10
+apg_candidate_window: 10
+apg_allow_same_frame: False
 
 seed: 42

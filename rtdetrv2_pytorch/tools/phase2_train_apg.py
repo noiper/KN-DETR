@@ -2,10 +2,12 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import torchvision.transforms.functional as TVF
+from PIL import Image
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
@@ -73,6 +75,69 @@ def _freeze_detector_train_apg_only(model: Any) -> None:
         param.requires_grad = True
 
 
+def _build_adjacent_index(dataset: Any) -> Tuple[Dict[int, List[int]], Dict[int, str], Optional[Path]]:
+    """
+    Build per-frame adjacent candidate index from dataset metadata.
+    Returns:
+      - adjacent_map: image_id -> ordered adjacent image_id list (same video)
+      - id_to_file: image_id -> relative file path
+      - root_dir: dataset root path if available
+    """
+    adjacent_map: Dict[int, List[int]] = {}
+    id_to_file: Dict[int, str] = {}
+    root_dir = Path(dataset.root_dir) if hasattr(dataset, 'root_dir') else None
+
+    if not hasattr(dataset, 'video_frames'):
+        return adjacent_map, id_to_file, root_dir
+
+    for _, frames in dataset.video_frames.items():
+        ids = [int(f['id']) for f in frames]
+        for i, frame in enumerate(frames):
+            image_id = int(frame['id'])
+            id_to_file[image_id] = frame['file_name']
+            neighbors = [ids[j] for j in sorted(range(len(ids)), key=lambda j: abs(j - i)) if j != i]
+            adjacent_map[image_id] = neighbors
+    return adjacent_map, id_to_file, root_dir
+
+
+def _sample_adjacent_candidates(
+    non_key_image_id: int,
+    candidate_window: int,
+    sampled_keys: int,
+    adjacent_map: Dict[int, List[int]],
+    allow_same_frame: bool,
+) -> List[int]:
+    neighbors = adjacent_map.get(non_key_image_id, [])
+    if candidate_window > 0:
+        neighbors = neighbors[:candidate_window]
+    if not allow_same_frame:
+        neighbors = [nid for nid in neighbors if nid != non_key_image_id]
+    if not neighbors:
+        return []
+    sample_count = min(sampled_keys, len(neighbors))
+    perm = torch.randperm(len(neighbors))[:sample_count].tolist()
+    return [neighbors[i] for i in perm]
+
+
+def _load_and_resize_key_image(
+    image_id: int,
+    id_to_file: Dict[int, str],
+    root_dir: Optional[Path],
+    ref_hw: Tuple[int, int],
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if root_dir is None or image_id not in id_to_file:
+        return None
+    img_path = root_dir / id_to_file[image_id]
+    if not img_path.exists():
+        return None
+
+    with Image.open(img_path).convert('RGB') as img:
+        resized = TVF.resize(img, list(ref_hw))
+        tensor = TVF.to_tensor(resized).unsqueeze(0).to(device)
+    return tensor
+
+
 def train_one_epoch(
     model: Any,
     criterion,
@@ -81,6 +146,11 @@ def train_one_epoch(
     device: torch.device,
     beta: float,
     sampled_keys: int,
+    candidate_window: int,
+    allow_same_frame: bool,
+    adjacent_map: Dict[int, List[int]],
+    id_to_file: Dict[int, str],
+    root_dir: Optional[Path],
     print_freq: int,
 ) -> Dict[str, float]:
     model.eval()
@@ -105,25 +175,53 @@ def train_one_epoch(
         for b in range(batch_size):
             current_img = img_non_key[b:b + 1]
             current_target: List[Dict] = [target_non_key[b]]
+            current_image_id = int(current_target[0]['image_id'].item())
 
             with torch.no_grad():
                 current_s5 = model.extract_s5(current_img).detach()
+            current_h, current_w = int(current_img.shape[-2]), int(current_img.shape[-1])
 
-            cand_count = max(1, min(sampled_keys, batch_size))
-            candidate_indices = torch.randperm(batch_size, device=device)[:cand_count].tolist()
+            candidate_image_ids = _sample_adjacent_candidates(
+                non_key_image_id=current_image_id,
+                candidate_window=candidate_window,
+                sampled_keys=sampled_keys,
+                adjacent_map=adjacent_map,
+                allow_same_frame=allow_same_frame,
+            )
 
             candidate_cls_losses: List[torch.Tensor] = []
             candidate_key_s5: List[torch.Tensor] = []
 
             with torch.no_grad():
-                for cand_idx in candidate_indices:
-                    candidate_key_img = img_key[cand_idx:cand_idx + 1]
+                # Fallback: at least use paired key frame from this sample.
+                if not candidate_image_ids:
+                    candidate_key_img = img_key[b:b + 1]
                     model.forward_key_frame(candidate_key_img, None)
                     outputs_nk = model.forward_non_key_frame(current_img, None)
                     loss_dict = criterion(outputs_nk, current_target)
                     cls_loss = _extract_cls_loss(loss_dict)
                     candidate_cls_losses.append(cls_loss.detach())
                     candidate_key_s5.append(model.cached_key_s5.detach())
+                else:
+                    for cand_image_id in candidate_image_ids:
+                        candidate_key_img = _load_and_resize_key_image(
+                            image_id=cand_image_id,
+                            id_to_file=id_to_file,
+                            root_dir=root_dir,
+                            ref_hw=(current_h, current_w),
+                            device=device,
+                        )
+                        if candidate_key_img is None:
+                            continue
+                        model.forward_key_frame(candidate_key_img, None)
+                        outputs_nk = model.forward_non_key_frame(current_img, None)
+                        loss_dict = criterion(outputs_nk, current_target)
+                        cls_loss = _extract_cls_loss(loss_dict)
+                        candidate_cls_losses.append(cls_loss.detach())
+                        candidate_key_s5.append(model.cached_key_s5.detach())
+
+            if not candidate_cls_losses:
+                continue
 
             cls_losses = torch.stack(candidate_cls_losses)  # [num_candidates]
             epsilon = beta * torch.min(cls_losses)
@@ -168,6 +266,8 @@ def main():
     parser.add_argument('--beta', type=float, default=None)
     parser.add_argument('--sampled_keys', type=int, default=None)
     parser.add_argument('--lr', type=float, default=None)
+    parser.add_argument('--candidate_window', type=int, default=None)
+    parser.add_argument('--allow_same_frame', action='store_true')
     parser.add_argument('--print_freq', type=int, default=50)
     parser.add_argument('--seed', type=int, default=None)
     args = parser.parse_args()
@@ -189,6 +289,8 @@ def main():
     epochs = args.epochs if args.epochs is not None else int(cfg.yaml_cfg.get('apg_epochs', cfg.yaml_cfg.get('epoches', 5)))
     beta = args.beta if args.beta is not None else float(cfg.yaml_cfg.get('apg_beta', 1.5))
     sampled_keys = args.sampled_keys if args.sampled_keys is not None else int(cfg.yaml_cfg.get('apg_sampled_keys', 10))
+    candidate_window = args.candidate_window if args.candidate_window is not None else int(cfg.yaml_cfg.get('apg_candidate_window', cfg.yaml_cfg.get('max_frame_gap', 10)))
+    allow_same_frame = bool(args.allow_same_frame or cfg.yaml_cfg.get('apg_allow_same_frame', False))
     lr = args.lr if args.lr is not None else float(cfg.yaml_cfg.get('apg_lr', 1e-4))
     seed = args.seed if args.seed is not None else int(cfg.yaml_cfg.get('seed', 42))
     output_dir = Path(args.output_dir if args.output_dir else cfg.yaml_cfg.get('output_dir', './output/phase2_apg'))
@@ -199,11 +301,14 @@ def main():
         torch.cuda.manual_seed(seed)
 
     optimizer = torch.optim.AdamW(model.apg.parameters(), lr=lr, weight_decay=1e-4)
+    adjacent_map, id_to_file, root_dir = _build_adjacent_index(train_dataloader.dataset)
 
     print(f'Device: {device}')
     print(f'APG epochs: {epochs}')
     print(f'APG beta: {beta}')
     print(f'APG sampled keys: {sampled_keys}')
+    print(f'APG candidate window: {candidate_window}')
+    print(f'APG allow same frame: {allow_same_frame}')
     print(f'APG lr: {lr}')
     print(f'Output dir: {output_dir}')
 
@@ -217,6 +322,11 @@ def main():
             device=device,
             beta=beta,
             sampled_keys=sampled_keys,
+            candidate_window=candidate_window,
+            allow_same_frame=allow_same_frame,
+            adjacent_map=adjacent_map,
+            id_to_file=id_to_file,
+            root_dir=root_dir,
             print_freq=args.print_freq,
         )
         print(f'Epoch [{epoch + 1}/{epochs}] apg_loss={stats["apg_loss"]:.6f} pos_rate={stats["pseudo_positive_rate"]:.4f}')
@@ -229,6 +339,8 @@ def main():
             'apg_config': {
                 'beta': beta,
                 'sampled_keys': sampled_keys,
+                'candidate_window': candidate_window,
+                'allow_same_frame': allow_same_frame,
                 'lr': lr,
             },
         }
