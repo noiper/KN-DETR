@@ -67,12 +67,35 @@ def _load_tuning_weights(model: Any, tuning_path: str, device: torch.device) -> 
 
 
 def _freeze_detector_train_apg_only(model: Any) -> None:
-    for param in model.parameters():
+    """
+    Aggressively freeze all detector parameters and verify that only APG is trainable.
+    """
+    # 1. Freeze everything
+    for name, param in model.named_parameters():
         param.requires_grad = False
+
     if model.apg is None:
         raise RuntimeError('APG is disabled. Set enable_apg=True in config.')
-    for param in model.apg.parameters():
+
+    # 2. Unfreeze ONLY APG parameters
+    for name, param in model.apg.named_parameters():
         param.requires_grad = True
+
+    # 3. Explicit verification for problematic layers
+    # Ensures they stay frozen even if shared/referenced elsewhere
+    for name, param in model.named_parameters():
+        if any(x in name for x in ['decoder.query_pos_head', 'decoder.dec_score_head', 'decoder.dec_bbox_head',
+                                   'lightweight_decoder.query_pos_head', 'lightweight_decoder.dec_score_head', 'lightweight_decoder.dec_bbox_head']):
+            param.requires_grad = False
+
+    # 4. Print summary to terminal for user verification
+    unfrozen = [n for n, p in model.named_parameters() if p.requires_grad]
+    print(f"--- Parameter Freezing Summary ---")
+    print(f"  Total parameters: {len(list(model.parameters()))}")
+    print(f"  Unfrozen parameters: {len(unfrozen)}")
+    if len(unfrozen) > 0:
+        print(f"  Unfrozen roots: {set([n.split('.')[0] for n in unfrozen])}")
+    print(f"----------------------------------")
 
 
 def _build_adjacent_index(dataset: Any) -> Tuple[Dict[int, List[int]], Dict[int, str], Optional[Path]]:
@@ -280,6 +303,10 @@ def main():
     if model.apg is None:
         raise RuntimeError('APG is disabled by config. Set enable_apg: True.')
 
+    if hasattr(model, 'decouple_non_key_prediction_heads'):
+        model.decouple_non_key_prediction_heads()
+        print('Decoupled non-key prediction heads before loading warm-start weights.')
+
     _load_tuning_weights(model, args.tuning, device)
     _freeze_detector_train_apg_only(model)
 
@@ -344,6 +371,9 @@ def main():
                 'lr': lr,
             },
         }
+        epoch_path = output_dir / f"{epoch:02d}.pth"
+        torch.save(checkpoint, epoch_path)
+
         latest_path = output_dir / 'apg_latest.pth'
         torch.save(checkpoint, latest_path)
 
