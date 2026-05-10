@@ -135,6 +135,7 @@ class Phase1Trainer:
         self.same_frame = same_frame
         self.reuse_match_indices = reuse_match_indices
         self.provenance = provenance or {}
+        self.lambda_score = getattr(self.cfg, 'lambda_score', 2.0)
         
         valid_strategies = ['kd', 'kd_only', 'decoder_only', 'freeze_key', 'joint']
         if self.training_strategy not in valid_strategies:
@@ -146,7 +147,8 @@ class Phase1Trainer:
         print(f"\nTraining Strategy: {self.training_strategy}")
         if self.training_strategy == 'kd':
                self.lambda_kd = getattr(self.cfg, 'lambda_kd', 1.0)
-               print(f"  - KD Loss weight (lambda_kd): {self.lambda_kd}")
+               print(f"  - Feature KD weight (lambda_kd): {self.lambda_kd}")
+               print(f"  - Score KD weight (lambda_score): {self.lambda_score}")
 
         if self.same_frame:
             print("--same_frame is active.")
@@ -234,14 +236,15 @@ class Phase1Trainer:
                 if hasattr(self.model, 'encoder'):
                     self.model.encoder.eval()
                 if self.training_strategy in ['kd', 'kd_only', 'decoder_only'] and hasattr(self.model, 'decoder'):
-                    self.model.decoder.eval()
-                with torch.no_grad():
-                    outputs_key = self.model.forward_key_frame(img_key, target_key)
-                    if self.reuse_match_indices:
-                        _, key_indices = self.criterion(
-                            outputs_key, target_key, return_indices=True
-                        )
-
+                    if hasattr(self.model, 'decoder'):
+                        self.model.decoder.eval()
+                    with torch.no_grad():
+                        outputs_key = self.model.forward_key_frame(img_key, target_key)
+                        # Always get key indices for 'kd' strategy to enable Score Distillation
+                        if self.reuse_match_indices or self.training_strategy == 'kd':
+                            _, key_indices = self.criterion(
+                                outputs_key, target_key, return_indices=True
+                            )
             # 2. NON-KEY FRAME PATH (The Student)
             if self.training_strategy in ['kd', 'kd_only']:
 
@@ -262,7 +265,7 @@ class Phase1Trainer:
                 if self.training_strategy == 'kd_only':
                    loss_non_key = loss_kd
                 else:
-                    # Joint Tuning (kd strategy): Hungarian + Feature MSE
+                    # Joint Tuning (kd strategy): Hungarian + Feature MSE + Score KD
                     criterion_kwargs = {}
                     if self.reuse_match_indices:
                         if key_indices is None:
@@ -273,11 +276,40 @@ class Phase1Trainer:
                             target_non_key,
                             num_queries,
                         )
-                    loss_dict_non_key = self.criterion(
-                        outputs_non_key, target_non_key, **criterion_kwargs
+                    
+                    # Request indices from Non-Key matcher for score distillation
+                    loss_dict_non_key, non_key_indices = self.criterion(
+                        outputs_non_key, target_non_key, **criterion_kwargs, return_indices=True
                     )
                     loss_hungarian = sum(loss_dict_non_key.values())
-                    loss_non_key = loss_hungarian + self.lambda_kd * loss_kd
+                    
+                    # Score Distillation (Logit KD via MSE on probability vectors)
+                    loss_score_kd = 0.0
+                    batch_size = outputs_non_key['pred_logits'].shape[0]
+                    student_probs = outputs_non_key['pred_logits'].sigmoid()
+                    with torch.no_grad():
+                        teacher_probs = outputs_key['pred_logits'].sigmoid()
+                        
+                    num_matched_common = 0
+                    for b in range(batch_size):
+                        k_src, k_tgt = key_indices[b]
+                        nk_src, nk_tgt = non_key_indices[b]
+                        
+                        k_map = {t.item(): s for s, t in zip(k_src, k_tgt)}
+                        nk_map = {t.item(): s for s, t in zip(nk_src, nk_tgt)}
+                        
+                        common_gts = set(k_map.keys()) & set(nk_map.keys())
+                        for g in common_gts:
+                            s_idx = nk_map[g]
+                            t_idx = k_map[g]
+                            # Distill full class distribution for matched query
+                            loss_score_kd += F.mse_loss(student_probs[b, s_idx], teacher_probs[b, t_idx].detach())
+                            num_matched_common += 1
+                    
+                    if num_matched_common > 0:
+                        loss_score_kd /= num_matched_common
+                    
+                    loss_non_key = loss_hungarian + self.lambda_kd * loss_kd + self.lambda_score * loss_score_kd
 
             else:
                 # Standard Hungarian loss (decoder_only, freeze_key, and joint)
@@ -585,6 +617,8 @@ def main():
                        help='Reuse key-frame matcher indices for non-key loss (default: disabled)')
     parser.add_argument('--lambda_kd', type=float, default=None,
                        help='Weighted scale for KD loss (only used in kd strategy)')
+    parser.add_argument('--lambda_score', type=float, default=None,
+                       help='Weighted scale for Score KD loss (only used in kd strategy)')
 
     # Optional
     parser.add_argument('--resume', '-r', type=str, default=None, 
@@ -692,6 +726,9 @@ def main():
 
         if args.lambda_kd is not None:
             cfg.lambda_kd = args.lambda_kd
+        
+        if args.lambda_score is not None:
+            cfg.lambda_score = args.lambda_score
 
         summary_dir = getattr(cfg, 'summary_dir', os.path.join(output_dir, 'summary'))
         writer = SummaryWriter(log_dir=summary_dir)
