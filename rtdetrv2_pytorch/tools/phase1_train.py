@@ -135,7 +135,7 @@ class Phase1Trainer:
         self.same_frame = same_frame
         self.reuse_match_indices = reuse_match_indices
         self.provenance = provenance or {}
-        self.lambda_score = getattr(self.cfg, 'lambda_score', 2.0)
+        self.lambda_score = getattr(self.cfg, 'lambda_score', 15.0)
         
         valid_strategies = ['kd', 'kd_only', 'decoder_only', 'freeze_key', 'joint']
         if self.training_strategy not in valid_strategies:
@@ -146,7 +146,7 @@ class Phase1Trainer:
 
         print(f"\nTraining Strategy: {self.training_strategy}")
         if self.training_strategy == 'kd':
-               self.lambda_kd = getattr(self.cfg, 'lambda_kd', 1.0)
+               self.lambda_kd = getattr(self.cfg, 'lambda_kd', 150.0)
                print(f"  - Feature KD weight (lambda_kd): {self.lambda_kd}")
                print(f"  - Score KD weight (lambda_score): {self.lambda_score}")
 
@@ -189,7 +189,11 @@ class Phase1Trainer:
         total_loss = 0.0
         total_loss_key = 0.0
         total_loss_non_key = 0.0
-        
+
+        # Track KD components for logging
+        total_feat_mse = 0.0
+        total_score_mse = 0.0
+
         for batch_idx, batch in enumerate(self.dataloader):
             img_key, target_key, img_non_key, target_non_key = batch
             key_indices = None
@@ -199,20 +203,20 @@ class Phase1Trainer:
                 # Safely clone the target dictionaries
                 target_non_key = [{k: v.clone() if isinstance(v, torch.Tensor) else v 
                                   for k, v in t.items()} for t in target_key]
-                
+
             img_key = img_key.to(self.device)
             img_non_key = img_non_key.to(self.device)
             target_key = [{k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
                         for k, v in t.items()} for t in target_key]
             target_non_key = [{k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
                             for k, v in t.items()} for t in target_non_key]
-            
+
             self.optimizer.zero_grad()
-            
+
             loss = None
             loss_key_value = 0.0
             loss_non_key_value = 0.0
-            
+
             # 1. KEY FRAME PATH (The Teacher)
             if self.training_strategy == 'joint':
                 outputs_key = self.model.forward_key_frame(img_key, target_key)
@@ -241,10 +245,11 @@ class Phase1Trainer:
                     with torch.no_grad():
                         outputs_key = self.model.forward_key_frame(img_key, target_key)
                         # Always get key indices for 'kd' strategy to enable Score Distillation
-                        if self.reuse_match_indices or self.training_strategy == 'kd':
+                        if self.reuse_match_indices or self.training_strategy in ['kd', 'kd_only']:
                             _, key_indices = self.criterion(
                                 outputs_key, target_key, return_indices=True
                             )
+
             # 2. NON-KEY FRAME PATH (The Student)
             if self.training_strategy in ['kd', 'kd_only']:
 
@@ -252,64 +257,59 @@ class Phase1Trainer:
                     teacher_backbone_feats = self.model.backbone(img_non_key)
                     teacher_c3, teacher_c4, teacher_c5 = teacher_backbone_feats[-3:]
                     teacher_ccff = self.model.encoder([teacher_c3, teacher_c4, teacher_c5])
-                
+
                 outputs_non_key, student_fused = self.model.forward_non_key_frame(
                     img_non_key, target_non_key, return_fused=True
                 )
-                
-                loss_kd = 0.0
+
+                # --- Feature KD Logic ---
+                loss_kd_feat = 0.0
                 for s_feat, t_feat in zip(student_fused, teacher_ccff):
-                    # Normalized MSE focuses on feature "shape" and relative relationships
-                    loss_kd += F.mse_loss(F.normalize(s_feat, dim=1), F.normalize(t_feat, dim=1))
-                
-                if self.training_strategy == 'kd_only':
-                   loss_non_key = loss_kd
-                else:
-                    # Joint Tuning (kd strategy): Hungarian + Feature MSE + Score KD
-                    criterion_kwargs = {}
-                    if self.reuse_match_indices:
-                        if key_indices is None:
-                            raise RuntimeError("Expected key matcher indices, but got None with --reuse_match_indices")
-                        num_queries = outputs_non_key['pred_boxes'].shape[1]
-                        criterion_kwargs['cached_indices'] = self._sanitize_cached_indices(
-                            key_indices,
-                            target_non_key,
-                            num_queries,
-                        )
-                    
-                    # Request indices from Non-Key matcher for score distillation
-                    loss_dict_non_key, non_key_indices = self.criterion(
-                        outputs_non_key, target_non_key, **criterion_kwargs, return_indices=True
+                    loss_kd_feat += F.mse_loss(F.normalize(s_feat, dim=1), F.normalize(t_feat, dim=1))
+
+                # --- Score KD Logic ---
+                criterion_kwargs = {}
+                if self.reuse_match_indices:
+                    if key_indices is None:
+                        raise RuntimeError("Expected key matcher indices, but got None with --reuse_match_indices")
+                    num_queries = outputs_non_key['pred_boxes'].shape[1]
+                    criterion_kwargs['cached_indices'] = self._sanitize_cached_indices(
+                        key_indices, target_non_key, num_queries
                     )
-                    loss_hungarian = sum(loss_dict_non_key.values())
-                    
-                    # Score Distillation (Logit KD via MSE on probability vectors)
-                    loss_score_kd = 0.0
-                    batch_size = outputs_non_key['pred_logits'].shape[0]
-                    student_probs = outputs_non_key['pred_logits'].sigmoid()
-                    with torch.no_grad():
-                        teacher_probs = outputs_key['pred_logits'].sigmoid()
-                        
-                    num_matched_common = 0
-                    for b in range(batch_size):
-                        k_src, k_tgt = key_indices[b]
-                        nk_src, nk_tgt = non_key_indices[b]
-                        
-                        k_map = {t.item(): s for s, t in zip(k_src, k_tgt)}
-                        nk_map = {t.item(): s for s, t in zip(nk_src, nk_tgt)}
-                        
-                        common_gts = set(k_map.keys()) & set(nk_map.keys())
-                        for g in common_gts:
-                            s_idx = nk_map[g]
-                            t_idx = k_map[g]
-                            # Distill full class distribution for matched query
-                            loss_score_kd += F.mse_loss(student_probs[b, s_idx], teacher_probs[b, t_idx].detach())
-                            num_matched_common += 1
-                    
-                    if num_matched_common > 0:
-                        loss_score_kd /= num_matched_common
-                    
-                    loss_non_key = loss_hungarian + self.lambda_kd * loss_kd + self.lambda_score * loss_score_kd
+
+                loss_dict_non_key, non_key_indices = self.criterion(
+                    outputs_non_key, target_non_key, **criterion_kwargs, return_indices=True
+                )
+                loss_hungarian = sum(loss_dict_non_key.values())
+
+                loss_kd_score = 0.0
+                batch_size = outputs_non_key['pred_logits'].shape[0]
+                student_probs = outputs_non_key['pred_logits'].sigmoid()
+                with torch.no_grad():
+                    teacher_probs = outputs_key['pred_logits'].sigmoid()
+
+                num_matched_common = 0
+                for b in range(batch_size):
+                    k_src, k_tgt = key_indices[b]
+                    nk_src, nk_tgt = non_key_indices[b]
+                    k_map = {t.item(): s for s, t in zip(k_src, k_tgt)}
+                    nk_map = {t.item(): s for s, t in zip(nk_src, nk_tgt)}
+                    common_gts = set(k_map.keys()) & set(nk_map.keys())
+                    for g in common_gts:
+                        s_idx = nk_map[g]; t_idx = k_map[g]
+                        loss_kd_score += F.mse_loss(student_probs[b, s_idx], teacher_probs[b, t_idx].detach())
+                        num_matched_common += 1
+                if num_matched_common > 0:
+                    loss_kd_score /= num_matched_common
+
+                # Assign to non-key loss
+                if self.training_strategy == 'kd_only':
+                    loss_non_key = self.lambda_kd * loss_kd_feat + self.lambda_score * loss_kd_score
+                else:
+                    loss_non_key = loss_hungarian + self.lambda_kd * loss_kd_feat + self.lambda_score * loss_kd_score
+
+                total_feat_mse += loss_kd_feat.item()
+                total_score_mse += loss_kd_score.item() if isinstance(loss_kd_score, torch.Tensor) else loss_kd_score
 
             else:
                 # Standard Hungarian loss (decoder_only, freeze_key, and joint)
@@ -333,13 +333,13 @@ class Phase1Trainer:
                 loss_non_key = sum(loss_dict_non_key.values())
 
             loss_non_key_value = loss_non_key.item() if isinstance(loss_non_key, torch.Tensor) else loss_non_key
-            
+
             # 3. ACCUMULATE & BACKPROP
             if loss is None:
                 loss = loss_non_key
             else:
                 loss = (1 - self.lambda_non_key) * loss + self.lambda_non_key * loss_non_key
-            
+
             loss.backward()
             if self.clip_max_norm > 0:
                 torch.nn.utils.clip_grad_norm_(
@@ -347,29 +347,40 @@ class Phase1Trainer:
                     max_norm=self.clip_max_norm
                 )
             self.optimizer.step()
-            
+
             total_loss += loss.item() if loss is not None else 0.0
             total_loss_key += loss_key_value
             total_loss_non_key += loss_non_key_value
-            
+
             # Logging
             if batch_idx % self.print_freq == 0:
-                if self.training_strategy == 'joint':
+                if self.training_strategy == 'kd_only':
+                    print(f"Batch [{batch_idx}/{len(self.dataloader)}] "
+                          f"Loss: {loss.item():.4f} (Feat MSE: {loss_kd_feat.item():.6f}, Score MSE: {loss_kd_score:.6f})")
+                elif self.training_strategy == 'kd':
+                    print(f"Batch [{batch_idx}/{len(self.dataloader)}] "
+                          f"Loss: {loss.item():.4f} (Hungarian: {loss_hungarian.item():.4f}, Feat MSE: {loss_kd_feat.item():.6f}, Score MSE: {loss_kd_score:.6f})")
+                elif self.training_strategy == 'joint':
                     print(f"Epoch [{epoch+1}] Batch [{batch_idx}/{len(self.dataloader)}] "
                           f"Loss: {loss.item():.4f} "
                           f"(Key: {loss_key_value:.4f}, Non-Key: {loss_non_key_value:.4f})")
                 else:
                     print(f"Epoch [{epoch+1}] Batch [{batch_idx}/{len(self.dataloader)}] "
                           f"Loss: {loss.item():.4f} (Non-Key only)")
-        
+
         avg_loss = total_loss / len(self.dataloader)
         avg_loss_key = total_loss_key / len(self.dataloader)
         avg_loss_non_key = total_loss_non_key / len(self.dataloader)
-        
+
+        avg_feat_mse = total_feat_mse / len(self.dataloader)
+        avg_score_mse = total_score_mse / len(self.dataloader)
+
         return {
             'loss': avg_loss,
             'loss_key': avg_loss_key,
             'loss_non_key': avg_loss_non_key,
+            'feat_mse': avg_feat_mse,
+            'score_mse': avg_score_mse,
             'train_key': self.training_strategy == 'joint',
         }
         
@@ -627,6 +638,8 @@ def main():
                        help='Random seed (overrides config)')
     parser.add_argument('--epochs', type=int, default=None, 
                        help='Number of epochs (overrides config)')
+    parser.add_argument('--lr', type=float, default=None,
+                       help='Learning rate (overrides config)')
     parser.add_argument('--output_dir', type=str, default=None, 
                        help='Output directory (overrides config)')
     

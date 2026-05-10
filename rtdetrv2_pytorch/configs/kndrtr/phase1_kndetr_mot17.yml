@@ -7,8 +7,8 @@ __include__: [
 ]
 
 # Override output directory
-output_dir: './output/phase1_mot17_level4_kd'
-summary_dir: './output/phase1_mot17_level4_kd/summary'
+output_dir: './output/phase1_mot17_level4_kd_fixed_lowlr_highscore'
+summary_dir: './output/phase1_mot17_level4_kd_fixed_lowlr_highscore/summary'
 
 # Override to ResNet18
 PResNet:
@@ -33,7 +33,6 @@ RTDETRTransformer:
 
 # Phase 1 Temporal Training Specific Parameters
 lambda_non_key: 0.5      # Loss weight for non-key frames: L = L_key + λ*L_non_key
-lambda_score: 3.0
 
 # Non-key frame decoder configuration
 use_lightweight_decoder: True  # True: 1-layer decoder, False: 3-layer decoder (full)
