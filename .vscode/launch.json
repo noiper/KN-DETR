@@ -5,7 +5,7 @@
             "name": "Phase 1 Training (CPU)",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/rtdetrv2_pytorch/tools/phase1_training_v2.py",
+            "program": "${workspaceFolder}/rtdetrv2_pytorch/tools/phase1_training.py",
             "console": "integratedTerminal",
             "justMyCode": false,
             "python": "/home/robin/miniconda3/envs/rtdetr/bin/python",
@@ -25,18 +25,18 @@
             }
         },
                 {
-            "name": "Evaluate Real Time",
+            "name": "Phase 2 Training (CPU)",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/rtdetrv2_pytorch/tools/eval_realtime.py",
+            "program": "${workspaceFolder}/rtdetrv2_pytorch/tools/phase2_train.py",
             "console": "integratedTerminal",
             "justMyCode": false,
             "python": "/home/robin/miniconda3/envs/rtdetr/bin/python",
             "args": [
                 "-c",
-                "rtdetrv2_pytorch/configs/rtdetrv2/phase1_virat_r18vd.yml",
-                "-w",
-                "output/phase1_decoder/best_model.pth"
+                "rtdetrv2_pytorch/configs/kndrtr/phase2_kndetr_mot17.yml",
+                "-t",
+                "output/phase1_mot17_level10/02_340_662.pth"
             ],
             "cwd": "${workspaceFolder}",
             "env": {

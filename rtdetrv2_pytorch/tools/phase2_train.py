@@ -44,17 +44,31 @@ def _build_temporal_model(cfg: Any, device: torch.device) -> Any:
     return model
 
 
-def _extract_cls_loss(loss_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
-    cls_keys = []
+def _extract_target_loss(loss_dict: Dict[str, torch.Tensor], loss_type: str = 'both') -> torch.Tensor:
+    """
+    Extract the specified detection loss components from the loss dict.
+    Filters out auxiliary, denoising, and encoder losses.
+    """
+    relevant_keys = []
     for k in loss_dict.keys():
-        if not (k.startswith('loss_vfl') or k.startswith('loss_focal')):
+        # Always exclude auxiliary heads, denoising parts, and encoder-only losses
+        if any(x in k for x in ['_aux_', '_dn_', '_enc_']):
             continue
-        if '_aux_' in k or '_dn_' in k or '_enc_' in k:
-            continue
-        cls_keys.append(k)
-    if not cls_keys:
-        raise RuntimeError(f'No classification loss key found in loss_dict keys: {list(loss_dict.keys())}')
-    return sum(loss_dict[k] for k in cls_keys)
+
+        is_cls = k.startswith('loss_vfl') or k.startswith('loss_focal') or k.startswith('loss_class')
+        is_box = k.startswith('loss_bbox') or k.startswith('loss_giou') or k.startswith('loss_l1')
+
+        if loss_type == 'class' and is_cls:
+            relevant_keys.append(k)
+        elif loss_type == 'box' and is_box:
+            relevant_keys.append(k)
+        elif loss_type == 'both' and (is_cls or is_box):
+            relevant_keys.append(k)
+        
+    if not relevant_keys:
+        raise RuntimeError(f'No {loss_type} loss keys found in loss_dict keys: {list(loss_dict.keys())}')
+        
+    return sum(loss_dict[k] for k in relevant_keys)
 
 
 def _load_tuning_weights(model: Any, tuning_path: str, device: torch.device) -> None:
@@ -168,6 +182,7 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     beta: float,
+    loss_type: str,
     sampled_keys: int,
     candidate_window: int,
     allow_same_frame: bool,
@@ -184,7 +199,7 @@ def train_one_epoch(
     total_pairs = 0
     total_positive = 0
 
-    for batch_idx, (img_key, target_key, img_non_key, target_non_key) in enumerate(dataloader):
+    for batch_idx, (img_key, _, img_non_key, target_non_key) in enumerate(dataloader):
         img_key = img_key.to(device)
         img_non_key = img_non_key.to(device)
         target_non_key = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in target_non_key]
@@ -212,7 +227,7 @@ def train_one_epoch(
                 allow_same_frame=allow_same_frame,
             )
 
-            candidate_cls_losses: List[torch.Tensor] = []
+            candidate_target_losses: List[torch.Tensor] = []
             candidate_key_s5: List[torch.Tensor] = []
 
             with torch.no_grad():
@@ -222,8 +237,8 @@ def train_one_epoch(
                     model.forward_key_frame(candidate_key_img, None)
                     outputs_nk = model.forward_non_key_frame(current_img, None)
                     loss_dict = criterion(outputs_nk, current_target)
-                    cls_loss = _extract_cls_loss(loss_dict)
-                    candidate_cls_losses.append(cls_loss.detach())
+                    target_loss_val = _extract_target_loss(loss_dict, loss_type)
+                    candidate_target_losses.append(target_loss_val.detach())
                     candidate_key_s5.append(model.cached_key_s5.detach())
                 else:
                     for cand_image_id in candidate_image_ids:
@@ -239,16 +254,16 @@ def train_one_epoch(
                         model.forward_key_frame(candidate_key_img, None)
                         outputs_nk = model.forward_non_key_frame(current_img, None)
                         loss_dict = criterion(outputs_nk, current_target)
-                        cls_loss = _extract_cls_loss(loss_dict)
-                        candidate_cls_losses.append(cls_loss.detach())
+                        target_loss_val = _extract_target_loss(loss_dict, loss_type)
+                        candidate_target_losses.append(target_loss_val.detach())
                         candidate_key_s5.append(model.cached_key_s5.detach())
 
-            if not candidate_cls_losses:
+            if not candidate_target_losses:
                 continue
 
-            cls_losses = torch.stack(candidate_cls_losses)  # [num_candidates]
-            epsilon = beta * torch.min(cls_losses)
-            pseudo_labels = (cls_losses > epsilon).float()
+            target_losses = torch.stack(candidate_target_losses)  # [num_candidates]
+            epsilon = beta * torch.min(target_losses)
+            pseudo_labels = (target_losses > epsilon).float()
 
             apg_logits = []
             for key_s5 in candidate_key_s5:
@@ -284,9 +299,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', '-c', type=str, required=True)
     parser.add_argument('--tuning', '-t', type=str, required=True, help='Temporal checkpoint to warm start detector paths.')
+    parser.add_argument('--resume', '-r', type=str, default=None, help='Path to checkpoint to resume training from.')
     parser.add_argument('--output_dir', type=str, default=None)
     parser.add_argument('--epochs', type=int, default=None)
     parser.add_argument('--beta', type=float, default=None)
+    parser.add_argument('--loss', type=str, choices=['class', 'box', 'both'], default='both', help='Loss type for routing: class, box, or both (default).')
     parser.add_argument('--sampled_keys', type=int, default=None)
     parser.add_argument('--lr', type=float, default=None)
     parser.add_argument('--candidate_window', type=int, default=None)
@@ -330,17 +347,29 @@ def main():
     optimizer = torch.optim.AdamW(model.apg.parameters(), lr=lr, weight_decay=1e-4)
     adjacent_map, id_to_file, root_dir = _build_adjacent_index(train_dataloader.dataset)
 
+    start_epoch = 0
+    best_loss = float('inf')
+
+    if args.resume:
+        print(f"Resuming from checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_loss = checkpoint.get('best_loss', float('inf'))
+        print(f"Successfully resumed from epoch {start_epoch} (best_loss: {best_loss:.6f})")
+
     print(f'Device: {device}')
     print(f'APG epochs: {epochs}')
     print(f'APG beta: {beta}')
+    print(f'APG loss type: {args.loss}')
     print(f'APG sampled keys: {sampled_keys}')
     print(f'APG candidate window: {candidate_window}')
     print(f'APG allow same frame: {allow_same_frame}')
     print(f'APG lr: {lr}')
     print(f'Output dir: {output_dir}')
 
-    best_loss = float('inf')
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         stats = train_one_epoch(
             model=model,
             criterion=criterion,
@@ -348,6 +377,7 @@ def main():
             optimizer=optimizer,
             device=device,
             beta=beta,
+            loss_type=args.loss,
             sampled_keys=sampled_keys,
             candidate_window=candidate_window,
             allow_same_frame=allow_same_frame,
@@ -363,6 +393,7 @@ def main():
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'metrics': stats,
+            'best_loss': best_loss,
             'apg_config': {
                 'beta': beta,
                 'sampled_keys': sampled_keys,
@@ -379,6 +410,7 @@ def main():
 
         if stats['apg_loss'] < best_loss:
             best_loss = stats['apg_loss']
+            checkpoint['best_loss'] = best_loss # Update best_loss in current checkpoint for next save
             best_path = output_dir / 'apg_best.pth'
             torch.save(checkpoint, best_path)
             print(f'New best APG checkpoint: {best_path}')
