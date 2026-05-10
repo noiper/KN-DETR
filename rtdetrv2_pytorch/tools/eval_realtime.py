@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from src.core import YAMLConfig
 from src.zoo.temporal_rtdetr import TemporalRTDETR
 from pycocotools.cocoeval import COCOeval
+from typing import Dict
 
 def format_coco(targets, outputs, results_list):
     """Converts tensor outputs to the exact dictionary format required by COCOeval"""
@@ -114,6 +115,13 @@ def extract_video_id(file_name):
         return parts[0]
     return "default_video"
 
+def _extract_total_loss(loss_dict: Dict[str, torch.Tensor]) -> float:
+    """Extracts main detection loss, ignoring auxiliary and denoising."""
+    relevant_keys = [k for k in loss_dict.keys() if not any(x in k for x in ['_aux_', '_dn_', '_enc_'])]
+    if not relevant_keys:
+        return 0.0
+    return sum(loss_dict[k] for k in relevant_keys).item()
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Temporal RT-DETR in Real-Time Simulation")
     parser.add_argument('--config', '-c', type=str, required=True, help='Path to config yml')
@@ -198,7 +206,13 @@ def main():
     # --- PHYSICAL DATALOADER REBUILD FOR BATCH_SIZE=1 ---
     base_val_loader = cfg.val_dataloader
     from torch.utils.data import DataLoader
+    from src.data.transforms import ConvertBoxes, SanitizeBoundingBoxes
     
+    # Add necessary box conversions for criterion compatibility
+    # These won't affect COCOeval as it uses image_id to look up ground truth
+    base_val_loader.dataset.transforms.transforms.append(SanitizeBoundingBoxes(min_size=1))
+    base_val_loader.dataset.transforms.transforms.append(ConvertBoxes(fmt='cxcywh', normalize=True))
+
     print("Rebuilding validation dataloader to force batch_size=1...")
     val_dataloader = DataLoader(
         dataset=base_val_loader.dataset,
@@ -211,6 +225,8 @@ def main():
     # -----------------------------------------------------
     coco_gt = val_dataloader.dataset.coco
     postprocessor = cfg.postprocessor
+    criterion = cfg.criterion
+    criterion.eval()
     print(f"Non-key mode: {'baseline (reuse key detections)' if args.baseline else 'model forward'}")
     
     res_key = []
@@ -220,8 +236,8 @@ def main():
     latest_key_results = None
     
     metrics = {
-        'k_time': 0.0, 'k_mem': 0.0, 'k_frames': 0,
-        'nk_time': 0.0, 'nk_mem': 0.0, 'nk_frames': 0
+        'k_time': 0.0, 'k_mem': 0.0, 'k_frames': 0, 'k_loss': 0.0,
+        'nk_time': 0.0, 'nk_mem': 0.0, 'nk_frames': 0, 'nk_loss': 0.0
     }
 
     # The length of one full cycle (e.g., K-NK-NK has a cycle length of 3)
@@ -258,6 +274,7 @@ def main():
             # ==========================================
             if step == 0:
                 img_key = img_key.to(device)
+                target_key = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in target_key]
                 
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -277,6 +294,10 @@ def main():
                     metrics['k_frames'] += 1
                     if torch.cuda.is_available():
                         metrics['k_mem'] += torch.cuda.max_memory_allocated() / (1024 ** 2)
+                    
+                    # Loss tracking
+                    loss_dict = criterion(out_k, target_key)
+                    metrics['k_loss'] += _extract_total_loss(loss_dict)
                 
                 orig_sizes_k = torch.stack([t["orig_size"] for t in target_key], dim=0).to(device)
                 latest_key_results = postprocessor(out_k, orig_sizes_k)
@@ -288,6 +309,7 @@ def main():
             # NON-KEY FRAME ARRIVES (Every step except the skipped one)
             # ==========================================
             if img_non_key is not None and len(img_non_key) > 0:
+                target_non_key = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in target_non_key]
                 if args.baseline:
                     if latest_key_results is None:
                         raise RuntimeError("No cached key results available for non-key propagation")
@@ -312,6 +334,11 @@ def main():
                     
                     orig_sizes_nk = torch.stack([t["orig_size"] for t in target_non_key], dim=0).to(device)
                     res_nk_batch = postprocessor(out_nk, orig_sizes_nk)
+
+                    if i >= args.warmup:
+                        # Loss tracking for non-key model
+                        loss_dict = criterion(out_nk, target_non_key)
+                        metrics['nk_loss'] += _extract_total_loss(loss_dict)
                 
                 if i >= args.warmup:
                     if not args.baseline:
@@ -319,6 +346,9 @@ def main():
                         metrics['nk_frames'] += 1
                         if torch.cuda.is_available():
                             metrics['nk_mem'] += torch.cuda.max_memory_allocated() / (1024 ** 2)
+                    else:
+                        # For baseline, we still track frames but time is near-zero
+                        metrics['nk_frames'] += 1
                 
                 format_coco(target_non_key, res_nk_batch, res_nk)
                 for t in target_non_key:
@@ -332,6 +362,9 @@ def main():
     
     avg_k_mem = (metrics['k_mem'] / metrics['k_frames']) if metrics['k_frames'] > 0 else 0
     avg_nk_mem = (metrics['nk_mem'] / metrics['nk_frames']) if metrics['nk_frames'] > 0 else 0
+    
+    avg_k_loss = (metrics['k_loss'] / metrics['k_frames']) if metrics['k_frames'] > 0 else 0
+    avg_nk_loss = (metrics['nk_loss'] / metrics['nk_frames']) if metrics['nk_frames'] > 0 else 0
 
     key_scale = args.key_score
     nonkey_scale = args.nonkey_score
@@ -379,8 +412,8 @@ def main():
     print(f"FINAL SUMMARY (Level {args.nk_per_key} | Stride {cycle_len})")
     print("="*70)
     print(f"Score scales -> key: {key_scale:.3f}, non-key: {nonkey_scale:.3f}")
-    print(f"Key      mAP: {map_k:.4f} | mAP50: {map50_k:.4f}")
-    print(f"Non-Key  mAP: {map_nk:.4f} | mAP50: {map50_nk:.4f}")
+    print(f"Key      mAP: {map_k:.4f} | mAP50: {map50_k:.4f} | Loss: {avg_k_loss:.4f}")
+    print(f"Non-Key  mAP: {map_nk:.4f} | mAP50: {map50_nk:.4f} | Loss: {avg_nk_loss:.4f}")
     print(f"Combined mAP: {combined_map:.4f} | mAP50: {combined_map50:.4f}")
     print("-"*70)
     print(f"Key Latency: {avg_k_time:.2f} ms | Key VRAM: {avg_k_mem:.2f} MB")

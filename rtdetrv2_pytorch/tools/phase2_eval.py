@@ -75,6 +75,14 @@ def _load_checkpoint(model: Any, ckpt_path: str, device: torch.device) -> None:
     print(f'  Unexpected keys: {len(unexpected)}')
 
 
+def _extract_total_loss(loss_dict: Dict[str, torch.Tensor]) -> float:
+    """Extracts main detection loss, ignoring auxiliary and denoising."""
+    relevant_keys = [k for k in loss_dict.keys() if not any(x in k for x in ['_aux_', '_dn_', '_enc_'])]
+    if not relevant_keys:
+        return 0.0
+    return sum(loss_dict[k] for k in relevant_keys).item()
+
+
 def format_coco(targets, outputs, results_list):
     """Converts tensor outputs to the exact dictionary format required by COCOeval"""
     for target, output in zip(targets, outputs):
@@ -156,7 +164,14 @@ def evaluate_apg_stream(
             cfg.yaml_cfg['val_dataloader']['dataset']['pair_sampling_strategy'] = 'all'
 
     from torch.utils.data import DataLoader
+    from src.data.transforms import ConvertBoxes, SanitizeBoundingBoxes
+    
     base_val_loader = cfg.val_dataloader
+    # Add necessary box conversions for criterion compatibility
+    # These won't affect COCOeval as it uses image_id to look up ground truth
+    base_val_loader.dataset.transforms.transforms.append(SanitizeBoundingBoxes(min_size=1))
+    base_val_loader.dataset.transforms.transforms.append(ConvertBoxes(fmt='cxcywh', normalize=True))
+
     val_dataloader = DataLoader(
         dataset=base_val_loader.dataset,
         batch_size=1,
@@ -168,12 +183,19 @@ def evaluate_apg_stream(
     
     coco_gt = val_dataloader.dataset.coco
     postprocessor = cfg.postprocessor
+    criterion = cfg.criterion
+    criterion.eval()
     
     res_key = []
     res_nk = []
     eval_img_ids_key = set()
     eval_img_ids_nk = set()
     
+    total_key_loss = 0.0
+    total_nk_loss = 0.0
+    num_key_evals = 0
+    num_nk_evals = 0
+
     key_decisions = 0
     forced_key_decisions = 0
     apg_key_votes = 0
@@ -194,7 +216,14 @@ def evaluate_apg_stream(
         # 1. HANDLE START OF VIDEO (Initial Key Frame F0)
         if last_video_id is None or current_video_id != last_video_id:
             img_key = img_key.to(device)
+            target_key = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in target_key]
             out_k = model.forward_key_frame(img_key, None)
+            
+            # Loss tracking
+            loss_dict = criterion(out_k, target_key)
+            total_key_loss += _extract_total_loss(loss_dict)
+            num_key_evals += 1
+
             orig_sizes_k = torch.stack([t["orig_size"] for t in target_key], dim=0).to(device)
             res_k_batch = postprocessor(out_k, orig_sizes_k)
             format_coco(target_key, res_k_batch, res_key)
@@ -208,7 +237,7 @@ def evaluate_apg_stream(
 
         # 2. EVALUATE CURRENT FRAME (img_non_key, which is F_{i+1})
         cur_img = img_non_key.to(device)
-        cur_target = target_non_key 
+        cur_target = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in target_non_key]
         
         prev_key_s5 = model.cached_key_s5
         cur_s5 = model.extract_s5(cur_img)
@@ -226,10 +255,20 @@ def evaluate_apg_stream(
             out = model.forward_key_frame(cur_img, None)
             nk_since_key = 0
             is_key_frame = True
+            
+            # Loss tracking
+            loss_dict = criterion(out, cur_target)
+            total_key_loss += _extract_total_loss(loss_dict)
+            num_key_evals += 1
         else:
             out = model.forward_non_key_frame(cur_img, None)
             nk_since_key += 1
             is_key_frame = False
+            
+            # Loss tracking
+            loss_dict = criterion(out, cur_target)
+            total_nk_loss += _extract_total_loss(loss_dict)
+            num_nk_evals += 1
 
         total_frames += 1
         orig_sizes = torch.stack([t["orig_size"] for t in cur_target], dim=0).to(device)
@@ -286,7 +325,9 @@ def evaluate_apg_stream(
         'forced_key_ratio': forced_key_decisions / max(1, total_frames),
         'avg_interval': 1.0 / key_ratio if key_ratio > 0 else float('inf'),
         'total_frames': total_frames,
-        'key_score': key_scale, 'nonkey_score': nonkey_scale
+        'key_score': key_scale, 'nonkey_score': nonkey_scale,
+        'avg_key_loss': total_key_loss / max(1, num_key_evals),
+        'avg_nk_loss': total_nk_loss / max(1, num_nk_evals),
     }
 
 
@@ -321,8 +362,8 @@ def main():
     print(f"APG STREAM EVALUATION SUMMARY (Threshold: {args.threshold} | Max NK: {args.nk_per_key})")
     print("="*70)
     print(f"Score scales -> key: {stats['key_score']:.3f}, non-key: {stats['nonkey_score']:.3f}")
-    print(f"Key Only    mAP: {stats['key_mAP']:.4f} | mAP50: {stats['key_mAP50']:.4f}")
-    print(f"Non-Key Only mAP: {stats['nk_mAP']:.4f} | mAP50: {stats['nk_mAP50']:.4f}")
+    print(f"Key Only    mAP: {stats['key_mAP']:.4f} | mAP50: {stats['key_mAP50']:.4f} | Loss: {stats['avg_key_loss']:.4f}")
+    print(f"Non-Key Only mAP: {stats['nk_mAP']:.4f} | mAP50: {stats['nk_mAP50']:.4f} | Loss: {stats['avg_nk_loss']:.4f}")
     print(f"Combined     mAP: {stats['combined_mAP']:.4f} | mAP50: {stats['combined_mAP50']:.4f}")
     print("-"*70)
     print(f"Key Ratio: {stats['key_ratio']:.4f} ({stats['key_ratio']*100:.2f}%)")
