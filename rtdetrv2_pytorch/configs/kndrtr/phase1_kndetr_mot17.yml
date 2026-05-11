@@ -7,8 +7,8 @@ __include__: [
 ]
 
 # Override output directory
-output_dir: './output/phase1_mot17_level4_kd_fixed_lowlr_highscore'
-summary_dir: './output/phase1_mot17_level4_kd_fixed_lowlr_highscore/summary'
+output_dir: './output/phase1_mot17_level1_no_feature_kd_no_curriculum'
+summary_dir: './output/phase1_mot17_level1_no_feature_kd_no_curriculum/summary'
 
 # Override to ResNet18
 PResNet:
