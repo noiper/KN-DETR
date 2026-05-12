@@ -106,7 +106,7 @@ def scale_results(results, score_scale):
         return results
     scaled = []
     for det in results:
-        score = max(0.0, min(1.0, float(det['score']) * score_scale))
+        score = float(det['score']) * score_scale
         out = det.copy()
         out['score'] = score
         scaled.append(out)

@@ -7,8 +7,8 @@ __include__: [
 ]
 
 # Override output directory
-output_dir: './output/phase1_mot17_level1_no_feature_kd_no_curriculum'
-summary_dir: './output/phase1_mot17_level1_no_feature_kd_no_curriculum/summary'
+output_dir: './output/phase1_mot17_level4'
+summary_dir: './output/phase1_mot17_level4/summary'
 
 # Override to ResNet18
 PResNet:
@@ -40,13 +40,13 @@ reuse_position: 3             # Reuse query state from key decoder position (0=b
 non_key_decoder_layers: 1       # Number of layers for non-key decoder (1 or 3)
 
 # Training Settings
-epoches: 10
+epoches: 5
 clip_max_norm: 0.1
 
 # Learning Rate Scheduler (override)
 lr_scheduler:
   type: MultiStepLR
-  milestones: [7, 9]
+  milestones: [3, 5]
   gamma: 0.1
 
 # Logging and Checkpointing

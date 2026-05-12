@@ -55,6 +55,65 @@ def record_stats(results, target, iou_list, conf_list, score_thr, device, actual
         matched_confs = pred_scores[best_indices].cpu().numpy()
         conf_list.extend(matched_confs.tolist())
 
+def record_tp_fp_stats(results, target, tp_scores_list, fp_scores_list, score_thr, device, actual_size, iou_thr=0.5):
+    """
+    results: dict from postprocessor with 'boxes' (absolute xyxy)
+    target: list containing a dict with 'boxes' (GT)
+    """
+    keep = results['scores'] > score_thr
+    pred_boxes = results['boxes'][keep]
+    pred_scores = results['scores'][keep]
+    pred_labels = results['labels'][keep]
+    
+    gt_boxes_raw = target[0]['boxes']
+    gt_labels = target[0]['labels']
+    
+    if pred_boxes.numel() == 0:
+        return
+
+    if gt_boxes_raw.numel() == 0:
+        fp_scores_list.extend(pred_scores.cpu().numpy().tolist())
+        return
+
+    w, h = actual_size[0, 0], actual_size[0, 1]
+    is_normalized = (gt_boxes_raw <= 1.01).all()
+    if is_normalized:
+        gt_boxes_abs = gt_boxes_raw.to(device) * torch.tensor([w, h, w, h], device=device)
+        gt_boxes_xyxy = box_cxcywh_to_xyxy(gt_boxes_abs)
+    else:
+        gt_boxes_xyxy = gt_boxes_raw.to(device)
+
+    # [N_gt, M_pred]
+    ious, _ = box_iou(gt_boxes_xyxy, pred_boxes)
+    
+    # --- Move to CPU once to avoid synchronization bottleneck ---
+    pred_scores_np = pred_scores.cpu().numpy()
+    pred_labels_np = pred_labels.cpu().numpy()
+    gt_labels_np = gt_labels.numpy()
+    ious_np = ious.cpu().numpy()
+    
+    # Sort predictions by score descending
+    indices = np.argsort(-pred_scores_np)
+    matched_gt = np.zeros(gt_boxes_xyxy.shape[0], dtype=bool)
+    
+    for idx in indices:
+        label = pred_labels_np[idx]
+        best_iou = -1
+        best_gt_idx = -1
+        
+        for g_idx in range(gt_boxes_xyxy.shape[0]):
+            if gt_labels_np[g_idx] == label:
+                iou = ious_np[g_idx, idx]
+                if iou > best_iou:
+                    best_iou = iou
+                    best_gt_idx = g_idx
+        
+        if best_iou >= iou_thr and not matched_gt[best_gt_idx]:
+            tp_scores_list.append(float(pred_scores_np[idx]))
+            matched_gt[best_gt_idx] = True
+        else:
+            fp_scores_list.append(float(pred_scores_np[idx]))
+
 def extract_video_id(file_name):
     parts = os.path.normpath(file_name).split(os.sep)
     return parts[0] if len(parts) > 1 else "default_video"
@@ -133,6 +192,8 @@ def main():
 
     key_ious, nk_ious = [], []
     key_confs, nk_confs = [], []
+    key_tp_scores, key_fp_scores = [], []
+    nk_tp_scores, nk_fp_scores = [], []
     
     # Loss tracking
     loss_stats = {
@@ -173,6 +234,7 @@ def main():
                 # Metrics (IoU/Conf)
                 results_key = postprocessor(out_key, actual_size_key)[0]
                 record_stats(results_key, target_key, key_ious, key_confs, args.score_thr, device, actual_size_key)
+                record_tp_fp_stats(results_key, target_key, key_tp_scores, key_fp_scores, args.score_thr, device, actual_size_key)
                 
                 # Loss Reporting
                 l_dict = criterion(out_key, tk_loss)
@@ -206,6 +268,7 @@ def main():
                 loss_stats['nk']['box'].append((l_dict['loss_bbox'] + l_dict['loss_giou']).item())
             
             record_stats(results_nk, target_non_key, nk_ious, nk_confs, args.score_thr, device, actual_size_nk)
+            record_tp_fp_stats(results_nk, target_non_key, nk_tp_scores, nk_fp_scores, args.score_thr, device, actual_size_nk)
 
     # 4. Plotting
     plt.figure(figsize=(14, 6))
@@ -240,6 +303,14 @@ def main():
     print(f"\nSummary ({mode_str}):")
     print(f"  Key Path:  Avg IoU: {np.mean(key_ious):.4f} | Avg Conf: {np.mean(key_confs):.4f}")
     print(f"  NK Path:   Avg IoU: {np.mean(nk_ious):.4f} | Avg Conf: {np.mean(nk_confs):.4f}")
+    
+    def get_sep(tp, fp):
+        if not tp or not fp: return 0.0
+        return np.mean(tp) - np.mean(fp)
+
+    print(f"\nTP/FP Score Separation (mean_tp - mean_fp):")
+    print(f"  Key Path:  {get_sep(key_tp_scores, key_fp_scores):.4f}")
+    print(f"  NK Path:   {get_sep(nk_tp_scores, nk_fp_scores):.4f}")
     
     print(f"\nLoss Analysis (Raw Criterion Values):")
     if loss_stats['key']['class']:
