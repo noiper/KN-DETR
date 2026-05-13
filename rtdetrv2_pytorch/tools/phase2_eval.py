@@ -6,6 +6,7 @@ import contextlib
 import io
 from typing import Any, Dict, List, Set
 
+import numpy as np
 import torch
 from tqdm import tqdm
 
@@ -13,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 
 from src.core import YAMLConfig
 from src.zoo.temporal_rtdetr import TemporalRTDETR
+from src.zoo.rtdetr.box_ops import box_iou, box_cxcywh_to_xyxy
 from pycocotools.cocoeval import COCOeval
 
 
@@ -81,6 +83,137 @@ def _extract_total_loss(loss_dict: Dict[str, torch.Tensor]) -> float:
     if not relevant_keys:
         return 0.0
     return sum(loss_dict[k] for k in relevant_keys).item()
+
+
+def _extract_loss_components(loss_dict: Dict[str, torch.Tensor]) -> Dict[str, float]:
+    """Extract class/box loss components from criterion outputs."""
+    class_keys = []
+    box_keys = []
+    for k in loss_dict.keys():
+        if any(x in k for x in ['_aux_', '_dn_', '_enc_']):
+            continue
+        if k.startswith('loss_vfl') or k.startswith('loss_focal') or k.startswith('loss_class'):
+            class_keys.append(k)
+        if k.startswith('loss_bbox') or k.startswith('loss_giou') or k.startswith('loss_l1'):
+            box_keys.append(k)
+
+    class_loss = sum(loss_dict[k] for k in class_keys).item() if class_keys else 0.0
+    box_loss = sum(loss_dict[k] for k in box_keys).item() if box_keys else 0.0
+    return {'class': class_loss, 'box': box_loss}
+
+
+def _mean_or_zero(values: List[float]) -> float:
+    return float(np.mean(values)) if values else 0.0
+
+
+def _prepare_targets_for_loss(targets, device):
+    """
+    Criterion expects normalized cxcywh boxes in target['boxes'].
+    """
+    prepared = []
+    for t in targets:
+        nt = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()}
+        boxes = nt['boxes']
+        if boxes.numel() == 0:
+            prepared.append(nt)
+            continue
+
+        is_normalized = (boxes <= 1.01).all()
+        if not is_normalized:
+            h, w = nt['orig_size'][0], nt['orig_size'][1]
+            boxes = boxes.clone()
+            boxes[:, 2:] -= boxes[:, :2]  # xyxy -> xywh
+            boxes[:, :2] += boxes[:, 2:] / 2  # xywh -> cxcywh
+            boxes /= torch.tensor([w, h, w, h], device=device)
+            nt['boxes'] = boxes
+        prepared.append(nt)
+    return prepared
+
+
+def _record_iou_conf_stats(results, targets, iou_list, conf_list, score_thr, device):
+    """
+    Record best-match IoU and confidence per GT for a single-image result batch.
+    """
+    keep = results['scores'] > score_thr
+    pred_boxes = results['boxes'][keep]
+    pred_scores = results['scores'][keep]
+
+    target = targets[0]
+    gt_boxes_raw = target['boxes']
+    if gt_boxes_raw.numel() == 0:
+        return
+
+    h, w = target['orig_size'][0], target['orig_size'][1]
+    is_normalized = (gt_boxes_raw <= 1.01).all()
+    if is_normalized:
+        gt_boxes_abs = gt_boxes_raw.to(device) * torch.tensor([w, h, w, h], device=device)
+        gt_boxes_xyxy = box_cxcywh_to_xyxy(gt_boxes_abs)
+    else:
+        gt_boxes_xyxy = gt_boxes_raw.to(device)
+
+    if pred_boxes.numel() == 0:
+        iou_list.extend([0.0] * gt_boxes_xyxy.shape[0])
+        conf_list.extend([0.0] * gt_boxes_xyxy.shape[0])
+        return
+
+    ious, _ = box_iou(gt_boxes_xyxy, pred_boxes)
+    best_iou_vals, best_indices = ious.max(dim=1)
+    iou_list.extend(best_iou_vals.cpu().numpy().tolist())
+    conf_list.extend(pred_scores[best_indices].cpu().numpy().tolist())
+
+
+def _record_tp_fp_scores(results, targets, tp_scores, fp_scores, score_thr, device, iou_thr=0.5):
+    """
+    Record TP/FP scores by class-matched IoU assignment for a single-image result batch.
+    """
+    keep = results['scores'] > score_thr
+    pred_boxes = results['boxes'][keep]
+    pred_scores = results['scores'][keep]
+    pred_labels = results['labels'][keep]
+
+    target = targets[0]
+    gt_boxes_raw = target['boxes']
+    gt_labels = target['labels']
+
+    if pred_boxes.numel() == 0:
+        return
+    if gt_boxes_raw.numel() == 0:
+        fp_scores.extend(pred_scores.cpu().numpy().tolist())
+        return
+
+    h, w = target['orig_size'][0], target['orig_size'][1]
+    is_normalized = (gt_boxes_raw <= 1.01).all()
+    if is_normalized:
+        gt_boxes_abs = gt_boxes_raw.to(device) * torch.tensor([w, h, w, h], device=device)
+        gt_boxes_xyxy = box_cxcywh_to_xyxy(gt_boxes_abs)
+    else:
+        gt_boxes_xyxy = gt_boxes_raw.to(device)
+
+    ious, _ = box_iou(gt_boxes_xyxy, pred_boxes)
+    pred_scores_np = pred_scores.cpu().numpy()
+    pred_labels_np = pred_labels.cpu().numpy()
+    gt_labels_np = gt_labels.cpu().numpy()
+    ious_np = ious.cpu().numpy()
+
+    indices = np.argsort(-pred_scores_np)
+    matched_gt = np.zeros(gt_boxes_xyxy.shape[0], dtype=bool)
+
+    for idx in indices:
+        label = pred_labels_np[idx]
+        best_iou = -1.0
+        best_gt_idx = -1
+        for g_idx in range(gt_boxes_xyxy.shape[0]):
+            if gt_labels_np[g_idx] == label:
+                iou = ious_np[g_idx, idx]
+                if iou > best_iou:
+                    best_iou = iou
+                    best_gt_idx = g_idx
+
+        if best_gt_idx >= 0 and best_iou >= iou_thr and not matched_gt[best_gt_idx]:
+            tp_scores.append(float(pred_scores_np[idx]))
+            matched_gt[best_gt_idx] = True
+        else:
+            fp_scores.append(float(pred_scores_np[idx]))
 
 
 def format_coco(targets, outputs, results_list):
@@ -190,6 +323,25 @@ def evaluate_apg_stream(
     res_nk = []
     eval_img_ids_key = set()
     eval_img_ids_nk = set()
+
+    diag_stats = {
+        'key': {
+            'ious': [],
+            'confs': [],
+            'tp_scores': [],
+            'fp_scores': [],
+            'class_losses': [],
+            'box_losses': [],
+        },
+        'nk': {
+            'ious': [],
+            'confs': [],
+            'tp_scores': [],
+            'fp_scores': [],
+            'class_losses': [],
+            'box_losses': [],
+        },
+    }
     
     total_key_loss = 0.0
     total_nk_loss = 0.0
@@ -217,16 +369,30 @@ def evaluate_apg_stream(
         if last_video_id is None or current_video_id != last_video_id:
             img_key = img_key.to(device)
             target_key = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in target_key]
+            target_key_loss = _prepare_targets_for_loss(target_key, device)
             out_k = model.forward_key_frame(img_key, None)
             
             # Loss tracking
-            loss_dict = criterion(out_k, target_key)
+            loss_dict = criterion(out_k, target_key_loss)
             total_key_loss += _extract_total_loss(loss_dict)
             num_key_evals += 1
+            loss_components = _extract_loss_components(loss_dict)
+            diag_stats['key']['class_losses'].append(loss_components['class'])
+            diag_stats['key']['box_losses'].append(loss_components['box'])
 
             orig_sizes_k = torch.stack([t["orig_size"] for t in target_key], dim=0).to(device)
             res_k_batch = postprocessor(out_k, orig_sizes_k)
             format_coco(target_key, res_k_batch, res_key)
+            _record_iou_conf_stats(
+                res_k_batch[0], target_key_loss,
+                diag_stats['key']['ious'], diag_stats['key']['confs'],
+                score_thr=args.diag_score_thr, device=device,
+            )
+            _record_tp_fp_scores(
+                res_k_batch[0], target_key_loss,
+                diag_stats['key']['tp_scores'], diag_stats['key']['fp_scores'],
+                score_thr=args.diag_score_thr, device=device, iou_thr=args.diag_iou_thr,
+            )
             for t in target_key:
                 eval_img_ids_key.add(int(t['image_id'].item()))
             
@@ -238,6 +404,7 @@ def evaluate_apg_stream(
         # 2. EVALUATE CURRENT FRAME (img_non_key, which is F_{i+1})
         cur_img = img_non_key.to(device)
         cur_target = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in target_non_key]
+        cur_target_loss = _prepare_targets_for_loss(cur_target, device)
         
         prev_key_s5 = model.cached_key_s5
         cur_s5 = model.extract_s5(cur_img)
@@ -257,18 +424,24 @@ def evaluate_apg_stream(
             is_key_frame = True
             
             # Loss tracking
-            loss_dict = criterion(out, cur_target)
+            loss_dict = criterion(out, cur_target_loss)
             total_key_loss += _extract_total_loss(loss_dict)
             num_key_evals += 1
+            loss_components = _extract_loss_components(loss_dict)
+            diag_stats['key']['class_losses'].append(loss_components['class'])
+            diag_stats['key']['box_losses'].append(loss_components['box'])
         else:
             out = model.forward_non_key_frame(cur_img, None)
             nk_since_key += 1
             is_key_frame = False
             
             # Loss tracking
-            loss_dict = criterion(out, cur_target)
+            loss_dict = criterion(out, cur_target_loss)
             total_nk_loss += _extract_total_loss(loss_dict)
             num_nk_evals += 1
+            loss_components = _extract_loss_components(loss_dict)
+            diag_stats['nk']['class_losses'].append(loss_components['class'])
+            diag_stats['nk']['box_losses'].append(loss_components['box'])
 
         total_frames += 1
         orig_sizes = torch.stack([t["orig_size"] for t in cur_target], dim=0).to(device)
@@ -276,10 +449,30 @@ def evaluate_apg_stream(
         
         if is_key_frame:
             format_coco(cur_target, res_batch, res_key)
+            _record_iou_conf_stats(
+                res_batch[0], cur_target_loss,
+                diag_stats['key']['ious'], diag_stats['key']['confs'],
+                score_thr=args.diag_score_thr, device=device,
+            )
+            _record_tp_fp_scores(
+                res_batch[0], cur_target_loss,
+                diag_stats['key']['tp_scores'], diag_stats['key']['fp_scores'],
+                score_thr=args.diag_score_thr, device=device, iou_thr=args.diag_iou_thr,
+            )
             for t in cur_target:
                 eval_img_ids_key.add(int(t['image_id'].item()))
         else:
             format_coco(cur_target, res_batch, res_nk)
+            _record_iou_conf_stats(
+                res_batch[0], cur_target_loss,
+                diag_stats['nk']['ious'], diag_stats['nk']['confs'],
+                score_thr=args.diag_score_thr, device=device,
+            )
+            _record_tp_fp_scores(
+                res_batch[0], cur_target_loss,
+                diag_stats['nk']['tp_scores'], diag_stats['nk']['fp_scores'],
+                score_thr=args.diag_score_thr, device=device, iou_thr=args.diag_iou_thr,
+            )
             for t in cur_target:
                 eval_img_ids_nk.add(int(t['image_id'].item()))
 
@@ -315,6 +508,11 @@ def evaluate_apg_stream(
     c_map, c_map50, c_map75 = evaluate_map(coco_gt, scaled_res_key + final_filtered_nk, combined_img_ids)
 
     key_ratio = key_decisions / max(1, total_frames)
+
+    def _tp_fp_sep(tp_scores: List[float], fp_scores: List[float]) -> float:
+        if not tp_scores or not fp_scores:
+            return 0.0
+        return float(np.mean(tp_scores) - np.mean(fp_scores))
     
     return {
         'key_mAP': map_k, 'key_mAP50': map50_k,
@@ -328,6 +526,16 @@ def evaluate_apg_stream(
         'key_score': key_scale, 'nonkey_score': nonkey_scale,
         'avg_key_loss': total_key_loss / max(1, num_key_evals),
         'avg_nk_loss': total_nk_loss / max(1, num_nk_evals),
+        'avg_key_iou': _mean_or_zero(diag_stats['key']['ious']),
+        'avg_nk_iou': _mean_or_zero(diag_stats['nk']['ious']),
+        'avg_key_conf': _mean_or_zero(diag_stats['key']['confs']),
+        'avg_nk_conf': _mean_or_zero(diag_stats['nk']['confs']),
+        'key_score_sep': _tp_fp_sep(diag_stats['key']['tp_scores'], diag_stats['key']['fp_scores']),
+        'nk_score_sep': _tp_fp_sep(diag_stats['nk']['tp_scores'], diag_stats['nk']['fp_scores']),
+        'avg_key_class_loss': _mean_or_zero(diag_stats['key']['class_losses']),
+        'avg_nk_class_loss': _mean_or_zero(diag_stats['nk']['class_losses']),
+        'avg_key_box_loss': _mean_or_zero(diag_stats['key']['box_losses']),
+        'avg_nk_box_loss': _mean_or_zero(diag_stats['nk']['box_losses']),
     }
 
 
@@ -342,6 +550,8 @@ def main():
     parser.add_argument('--nonkey_score', '-ns', type=float, default=1.0)
     parser.add_argument('--tune_score', '-ts', action='store_true')
     parser.add_argument('--score_grid', type=str, default='0.8,0.9,1.0,1.1,1.2')
+    parser.add_argument('--diag_score_thr', type=float, default=-1.0, help='Score threshold for IoU/conf and TP/FP diagnostics. Use <0 for no filtering (default).')
+    parser.add_argument('--diag_iou_thr', type=float, default=0.5, help='IoU threshold for TP/FP assignment in diagnostics.')
     args = parser.parse_args()
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -365,6 +575,16 @@ def main():
     print(f"Key Only    mAP: {stats['key_mAP']:.4f} | mAP50: {stats['key_mAP50']:.4f} | Loss: {stats['avg_key_loss']:.4f}")
     print(f"Non-Key Only mAP: {stats['nk_mAP']:.4f} | mAP50: {stats['nk_mAP50']:.4f} | Loss: {stats['avg_nk_loss']:.4f}")
     print(f"Combined     mAP: {stats['combined_mAP']:.4f} | mAP50: {stats['combined_mAP50']:.4f}")
+    print("-"*70)
+    print("Diagnostics (APG-routed):")
+    print(f"  Key Path:  Avg IoU: {stats['avg_key_iou']:.4f} | Avg Conf: {stats['avg_key_conf']:.4f}")
+    print(f"  NK Path:   Avg IoU: {stats['avg_nk_iou']:.4f} | Avg Conf: {stats['avg_nk_conf']:.4f}")
+    print("\nTP/FP Score Separation (mean_tp - mean_fp):")
+    print(f"  Key Path:  {stats['key_score_sep']:.4f}")
+    print(f"  NK Path:   {stats['nk_score_sep']:.4f}")
+    print("\nLoss Analysis (Raw Criterion Values):")
+    print(f"  Key Loss:  Class: {stats['avg_key_class_loss']:.4f} | Box: {stats['avg_key_box_loss']:.4f}")
+    print(f"  NK Loss:   Class: {stats['avg_nk_class_loss']:.4f} | Box: {stats['avg_nk_box_loss']:.4f}")
     print("-"*70)
     print(f"Key Ratio: {stats['key_ratio']:.4f} ({stats['key_ratio']*100:.2f}%)")
     print(f"  - APG Votes: {stats['apg_key_vote_ratio']*100:.2f}%")

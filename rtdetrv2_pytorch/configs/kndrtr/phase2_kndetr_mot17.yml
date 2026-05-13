@@ -4,8 +4,8 @@ __include__: [
   './phase1_kndetr_mot17.yml',
 ]
 
-output_dir: './output/phase2_mot17_level10_125_all'
-summary_dir: './output/phase2_mot17_level10_125_all/summary'
+output_dir: './output/phase2_mot17_level4'
+summary_dir: './output/phase2_mot17_level4/summary'
 
 # Enable APG module in TemporalRTDETR
 enable_apg: True
@@ -16,10 +16,18 @@ apg_pool_size: 4
 # APG training hyperparameters
 apg_epochs: 10
 apg_lr: 0.0001
-apg_beta: 1.25
-apg_sampled_keys: 10
-apg_candidate_window: 10
-apg_allow_same_frame: False
+apg_beta: 1.15
+apg_loss_type: class
+apg_class_scale: 1.0
+apg_conf_lambda: 1.0
+apg_conf_topk: 10
+apg_eval_val: True
+apg_val_print_freq: 200
+apg_sampled_keys: 4
+apg_threshold_type: per_sample
+apg_val_threshold_type: per_sample
+apg_allow_same_frame: True
+
 
 # Override dataloader to disable spatial augmentations for APG training alignment
 train_dataloader: 
