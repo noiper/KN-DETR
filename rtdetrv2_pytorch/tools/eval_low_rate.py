@@ -11,6 +11,7 @@ import argparse
 import contextlib
 import io
 import torch
+import numpy as np
 from tqdm import tqdm
 
 # Ensure python path is correct when run from terminal
@@ -18,8 +19,127 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 
 from src.core import YAMLConfig
 from src.zoo.temporal_rtdetr import TemporalRTDETR
+from src.zoo.rtdetr.box_ops import box_iou, box_cxcywh_to_xyxy
 from pycocotools.cocoeval import COCOeval
 from typing import Dict
+
+def record_stats(results, target, iou_list, conf_list, score_thr, device, actual_size):
+    """
+    results: dict from postprocessor with 'boxes' (absolute xyxy)
+    target: list containing a dict with 'boxes' (GT)
+    actual_size: tensor of shape [1, 2] containing [W, H] of the image tensor
+    """
+    # filter by score
+    keep = results['scores'] > score_thr
+    pred_boxes = results['boxes'][keep] # [M, 4] xyxy
+    pred_scores = results['scores'][keep]
+    
+    # get GT boxes
+    gt_boxes_raw = target[0]['boxes'] # [N, 4]
+    if gt_boxes_raw.numel() == 0:
+        return
+        
+    w, h = actual_size[0, 0], actual_size[0, 1]
+    
+    # Handle GT Boxes conversion to absolute xyxy in the 640 space (actual_size)
+    is_normalized = (gt_boxes_raw <= 1.01).all()
+    if is_normalized:
+        gt_boxes_abs = gt_boxes_raw.to(device) * torch.tensor([w, h, w, h], device=device)
+        gt_boxes_xyxy = box_cxcywh_to_xyxy(gt_boxes_abs)
+    else:
+        gt_boxes_xyxy = gt_boxes_raw.to(device)
+
+    if pred_boxes.numel() == 0:
+        iou_list.extend([0.0] * gt_boxes_xyxy.shape[0])
+        conf_list.extend([0.0] * gt_boxes_xyxy.shape[0])
+    else:
+        # Pairwise IoU: [N_gt, M_pred]
+        ious, _ = box_iou(gt_boxes_xyxy, pred_boxes)
+        # Best IoU per GT
+        best_iou_vals, best_indices = ious.max(dim=1)
+        iou_list.extend(best_iou_vals.cpu().numpy().tolist())
+        
+        # Confidence of matched predictions
+        matched_confs = pred_scores[best_indices].cpu().numpy()
+        conf_list.extend(matched_confs.tolist())
+
+def record_tp_fp_stats(results, target, tp_scores_list, fp_scores_list, score_thr, device, actual_size, iou_thr=0.5):
+    """
+    results: dict from postprocessor with 'boxes' (absolute xyxy)
+    target: list containing a dict with 'boxes' (GT)
+    """
+    keep = results['scores'] > score_thr
+    pred_boxes = results['boxes'][keep]
+    pred_scores = results['scores'][keep]
+    pred_labels = results['labels'][keep]
+    
+    gt_boxes_raw = target[0]['boxes']
+    gt_labels = target[0]['labels']
+    
+    if pred_boxes.numel() == 0:
+        return
+
+    if gt_boxes_raw.numel() == 0:
+        fp_scores_list.extend(pred_scores.cpu().numpy().tolist())
+        return
+
+    w, h = actual_size[0, 0], actual_size[0, 1]
+    is_normalized = (gt_boxes_raw <= 1.01).all()
+    if is_normalized:
+        gt_boxes_abs = gt_boxes_raw.to(device) * torch.tensor([w, h, w, h], device=device)
+        gt_boxes_xyxy = box_cxcywh_to_xyxy(gt_boxes_abs)
+    else:
+        gt_boxes_xyxy = gt_boxes_raw.to(device)
+
+    # [N_gt, M_pred]
+    ious, _ = box_iou(gt_boxes_xyxy, pred_boxes)
+    
+    # --- Move to CPU once to avoid synchronization bottleneck ---
+    pred_scores_np = pred_scores.cpu().numpy()
+    pred_labels_np = pred_labels.cpu().numpy()
+    gt_labels_np = gt_labels.cpu().numpy()
+    ious_np = ious.cpu().numpy()
+    
+    # Sort predictions by score descending
+    indices = np.argsort(-pred_scores_np)
+    matched_gt = np.zeros(gt_boxes_xyxy.shape[0], dtype=bool)
+    
+    for idx in indices:
+        label = pred_labels_np[idx]
+        best_iou = -1
+        best_gt_idx = -1
+        
+        for g_idx in range(gt_boxes_xyxy.shape[0]):
+            if gt_labels_np[g_idx] == label:
+                iou = ious_np[g_idx, idx]
+                if iou > best_iou:
+                    best_iou = iou
+                    best_gt_idx = g_idx
+        
+        if best_iou >= iou_thr and not matched_gt[best_gt_idx]:
+            tp_scores_list.append(float(pred_scores_np[idx]))
+            matched_gt[best_gt_idx] = True
+        else:
+            fp_scores_list.append(float(pred_scores_np[idx]))
+
+def prepare_targets_for_loss(targets, device):
+    """
+    Criterion expects normalized cxcywh boxes in target['boxes']
+    """
+    new_targets = []
+    for t in targets:
+        nt = {k: v.to(device) for k, v in t.items()}
+        # Standardize boxes to normalized cxcywh if they aren't already
+        boxes = nt['boxes']
+        is_normalized = (boxes <= 1.01).all()
+        if not is_normalized:
+            w, h = nt['orig_size'][0], nt['orig_size'][1]
+            boxes[:, 2:] -= boxes[:, :2] # xyxy -> xywh
+            boxes[:, :2] += boxes[:, 2:] / 2 # xywh -> cxcywh
+            boxes /= torch.tensor([w, h, w, h], device=device)
+            nt['boxes'] = boxes
+        new_targets.append(nt)
+    return new_targets
 
 def format_coco(targets, outputs, results_list):
     """Converts tensor outputs to the exact dictionary format required by COCOeval"""
@@ -37,24 +157,6 @@ def format_coco(targets, outputs, results_list):
                 "bbox": [float(x1), float(y1), float(x2 - x1), float(y2 - y1)],
                 "score": float(scores[i])
             })
-
-def propagate_key_results_to_non_key_targets(key_results, non_key_targets):
-    """
-    Reuse key-frame detections directly as non-key predictions.
-    Keeps boxes/scores/labels and only changes destination image IDs via format_coco.
-    """
-    propagated = []
-    for output in key_results:
-        propagated.append({
-            'boxes': output['boxes'].clone(),
-            'scores': output['scores'].clone(),
-            'labels': output['labels'].clone(),
-        })
-    if len(propagated) != len(non_key_targets):
-        raise RuntimeError(
-            f"Batch size mismatch for propagation: key={len(propagated)} vs non-key={len(non_key_targets)}"
-        )
-    return propagated
 
 def scale_results(results, score_scale):
     if score_scale == 1.0:
@@ -127,16 +229,16 @@ def main():
     parser.add_argument('--config', '-c', type=str, required=True, help='Path to config yml')
     parser.add_argument('--weights','-w',  type=str, required=True, help='Path to checkpoint .pth file')
     parser.add_argument('--warmup', type=int, default=10, help='Ignore first N batches for timing/memory')
-    parser.add_argument('--nk_per_key', '-n', type=int, default=1, 
-                        help='Number of Non-Key frames per Key frame. 1 = (K, NK), 2 = (K, NK, NK), etc.')
-    parser.add_argument('--frame_stride', '-f', type=int, default=1,
-                        help='Stride between Key sequences. Overrides YAML config for clean usage.')
+    parser.add_argument('--skip', '-s', type=int, default=0,
+                        help='Number of frames to skip between evaluations. Default 0.')
     parser.add_argument('--baseline', action='store_true',
                         help='Baseline: reuse key-frame detections directly for non-key frames')
     parser.add_argument('--key_score', '-ks', type=float, default=1.0,
                         help='Multiply key-path confidence scores by this factor before evaluation')
     parser.add_argument('--nonkey_score', '-ns', type=float, default=1.0,
                         help='Multiply non-key-path confidence scores by this factor before evaluation')
+    parser.add_argument('--score_thr', '-st', type=float, default=0.3,
+                        help='Confidence threshold for diagnostic metrics (IoU, TP/FP)')
     parser.add_argument('--tune_score', '-ts', action='store_true',
                         help='Grid search key/non-key score scales for best combined mAP')
     parser.add_argument('--score_grid', type=str, default='0.8,0.9,1.0,1.1,1.2',
@@ -234,22 +336,32 @@ def main():
     eval_img_ids_key = set()
     eval_img_ids_nk = set()
     latest_key_results = None
+    latest_key_results_norm = None
+    out_k = None
+
+    # Diagnostic Stats
+    key_ious, nk_ious = [], []
+    key_confs, nk_confs = [], []
+    key_tp_scores, key_fp_scores = [], []
+    nk_tp_scores, nk_fp_scores = [], []
+    
+    loss_stats = {
+        'key': {'class': [], 'box': []},
+        'nk':  {'class': [], 'box': []}
+    }
     
     metrics = {
         'k_time': 0.0, 'k_mem': 0.0, 'k_frames': 0, 'k_loss': 0.0,
         'nk_time': 0.0, 'nk_mem': 0.0, 'nk_frames': 0, 'nk_loss': 0.0
     }
 
-    # The length of one full cycle (e.g., K-NK-NK has a cycle length of 3)
-    # If frame_stride is larger than the sequence length, we skip frames between sequences.
-    cycle_len = max(args.frame_stride, args.nk_per_key + 1)
-    cycle_step = 0
+    frame_idx = 0
     last_video_id = None
 
-    print(f"\n--- INITIATING REAL-TIME STREAM SIMULATION (1 Key : {args.nk_per_key} Non-Key) ---")
+    print(f"\n--- INITIATING LOW RATE SIMULATION (Skip: {args.skip}) ---")
     with torch.no_grad():
         for i, batch in enumerate(tqdm(val_dataloader, desc="Streaming Video")):
-            img_key, target_key, img_non_key, target_non_key = batch
+            img_key, target_key, _, _ = batch
             
             # --- VIDEO BOUNDARY DETECTION & CYCLE RESET ---
             img_id = int(target_key[0]['image_id'].item())
@@ -258,21 +370,25 @@ def main():
             
             if last_video_id is not None and current_video_id != last_video_id:
                 # Video changed! Reset the simulation cycle to start with a Key frame.
-                cycle_step = 0
+                frame_idx = 0
             last_video_id = current_video_id
             
-            # Determine where we are in the K-NK cycle
-            step = cycle_step % cycle_len
-            
-            if step >= args.nk_per_key:
-                # SKIP BATCH: Either the next cycle's overlapping frame, or we are in the inter-sequence stride gap.
-                cycle_step += 1
+            # LOW RATE SKIP LOGIC
+            if frame_idx % (args.skip + 1) != 0:
+                frame_idx += 1
                 continue
             
+            eval_idx = frame_idx // (args.skip + 1)
+            is_key_frame = (eval_idx % 2 == 0)
+            
+            # Use original image size for ALL evaluation and diagnostic coordinate scaling
+            orig_size = target_key[0]['orig_size'].to(device) # [W, H]
+            target_loss = prepare_targets_for_loss(target_key, device)
+
             # ==========================================
-            # KEY FRAME ARRIVES (Only on step 0)
+            # KEY FRAME PASS
             # ==========================================
-            if step == 0:
+            if is_key_frame:
                 img_key = img_key.to(device)
                 target_key = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in target_key]
                 
@@ -289,6 +405,13 @@ def main():
                     torch.cuda.synchronize()
                 t1 = time.perf_counter()
                 
+                orig_sizes_k = torch.stack([t["orig_size"] for t in target_key], dim=0).to(device)
+                latest_key_results = postprocessor(out_k, orig_sizes_k)[0]
+                
+                # Diagnostics
+                record_stats(latest_key_results, target_key, key_ious, key_confs, args.score_thr, device, orig_size.unsqueeze(0))
+                record_tp_fp_stats(latest_key_results, target_key, key_tp_scores, key_fp_scores, args.score_thr, device, orig_size.unsqueeze(0))
+
                 if i >= args.warmup:
                     metrics['k_time'] += (t1 - t0)
                     metrics['k_frames'] += 1
@@ -296,28 +419,53 @@ def main():
                         metrics['k_mem'] += torch.cuda.max_memory_allocated() / (1024 ** 2)
                     
                     # Loss tracking
-                    loss_dict = criterion(out_k, target_key)
+                    loss_dict = criterion(out_k, target_loss)
                     metrics['k_loss'] += _extract_total_loss(loss_dict)
+                    loss_stats['key']['class'].append(loss_dict['loss_vfl'].item())
+                    loss_stats['key']['box'].append((loss_dict['loss_bbox'] + loss_dict['loss_giou']).item())
                 
-                orig_sizes_k = torch.stack([t["orig_size"] for t in target_key], dim=0).to(device)
-                latest_key_results = postprocessor(out_k, orig_sizes_k)
-                format_coco(target_key, latest_key_results, res_key)
+                format_coco(target_key, [latest_key_results], res_key)
                 for t in target_key:
                     eval_img_ids_key.add(int(t['image_id'].item()))
+                
+                if args.baseline:
+                    norm_size = torch.tensor([[1.0, 1.0]], device=device)
+                    latest_key_results_norm = postprocessor(out_k, norm_size)[0]
             
             # ==========================================
-            # NON-KEY FRAME ARRIVES (Every step except the skipped one)
+            # NON-KEY FRAME PASS
             # ==========================================
-            if img_non_key is not None and len(img_non_key) > 0:
-                target_non_key = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in target_non_key]
+            else:
+                target_key = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in target_key]
                 if args.baseline:
-                    if latest_key_results is None:
+                    if latest_key_results_norm is None:
                         raise RuntimeError("No cached key results available for non-key propagation")
                     t2 = time.perf_counter()
-                    res_nk_batch = propagate_key_results_to_non_key_targets(latest_key_results, target_non_key)
+                    # Scale normalized key boxes to the CURRENT frame's original resolution
+                    res_nk_batch = {
+                        'boxes': latest_key_results_norm['boxes'] * orig_size.repeat(2),
+                        'scores': latest_key_results_norm['scores'],
+                        'labels': latest_key_results_norm['labels']
+                    }
                     t3 = time.perf_counter()
+
+                    # Baseline Loss Computation:
+                    # We pass the cached key outputs through the criterion against the current NK ground truth
+                    if i >= args.warmup:
+                        # Construct a mock output dictionary that the criterion can process
+                        # latest_key_results_norm contains 'boxes', 'scores', 'labels'
+                        # We need 'pred_logits' and 'pred_boxes' in normalized cxcywh
+                        # latest_key_results_norm['boxes'] is already normalized xyxy, need to convert
+                        
+                        # Note: This assumes out_k was cached. We need out_k from the Key pass.
+                        # Since out_k is exactly what produced latest_key_results_norm, 
+                        # we can just use the cached out_k for loss computation against tnk_loss.
+                        l_dict_nk = criterion(out_k, target_loss)
+                        metrics['nk_loss'] += _extract_total_loss(l_dict_nk)
+                        loss_stats['nk']['class'].append(l_dict_nk['loss_vfl'].item())
+                        loss_stats['nk']['box'].append((l_dict_nk['loss_bbox'] + l_dict_nk['loss_giou']).item())
                 else:
-                    img_non_key = img_non_key.to(device)
+                    img_key = img_key.to(device)
                     
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
@@ -326,20 +474,26 @@ def main():
                     t2 = time.perf_counter()
                     
                     # Relies on the cache stored during key frame pass
-                    out_nk = model.forward_non_key_frame(img_non_key, None)
+                    out_nk = model.forward_non_key_frame(img_key, None)
                     
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     t3 = time.perf_counter()
                     
-                    orig_sizes_nk = torch.stack([t["orig_size"] for t in target_non_key], dim=0).to(device)
-                    res_nk_batch = postprocessor(out_nk, orig_sizes_nk)
+                    orig_sizes_nk = torch.stack([t["orig_size"] for t in target_key], dim=0).to(device)
+                    res_nk_batch = postprocessor(out_nk, orig_sizes_nk)[0]
 
                     if i >= args.warmup:
                         # Loss tracking for non-key model
-                        loss_dict = criterion(out_nk, target_non_key)
+                        loss_dict = criterion(out_nk, target_loss)
                         metrics['nk_loss'] += _extract_total_loss(loss_dict)
+                        loss_stats['nk']['class'].append(loss_dict['loss_vfl'].item())
+                        loss_stats['nk']['box'].append((loss_dict['loss_bbox'] + loss_dict['loss_giou']).item())
                 
+                # Diagnostics
+                record_stats(res_nk_batch, target_key, nk_ious, nk_confs, args.score_thr, device, orig_size.unsqueeze(0))
+                record_tp_fp_stats(res_nk_batch, target_key, nk_tp_scores, nk_fp_scores, args.score_thr, device, orig_size.unsqueeze(0))
+
                 if i >= args.warmup:
                     if not args.baseline:
                         metrics['nk_time'] += (t3 - t2)
@@ -350,11 +504,11 @@ def main():
                         # For baseline, we still track frames but time is near-zero
                         metrics['nk_frames'] += 1
                 
-                format_coco(target_non_key, res_nk_batch, res_nk)
-                for t in target_non_key:
+                format_coco(target_key, [res_nk_batch], res_nk)
+                for t in target_key:
                     eval_img_ids_nk.add(int(t['image_id'].item()))
             
-            cycle_step += 1
+            frame_idx += 1
 
     # Calculate Averages
     avg_k_time = (metrics['k_time'] / metrics['k_frames']) * 1000 if metrics['k_frames'] else 0
@@ -409,7 +563,7 @@ def main():
     combined_map, combined_map50 = evaluate_map(coco_gt, scaled_combined, "COMBINED OVERALL AVERAGE", combined_img_ids)
 
     print("\n" + "="*70)
-    print(f"FINAL SUMMARY (Level {args.nk_per_key} | Stride {cycle_len})")
+    print(f"FINAL SUMMARY (Skip: {args.skip})")
     print("="*70)
     print(f"Score scales -> key: {key_scale:.3f}, non-key: {nonkey_scale:.3f}")
     print(f"Key      mAP: {map_k:.4f} | mAP50: {map50_k:.4f} | Loss: {avg_k_loss:.4f}")
@@ -421,6 +575,28 @@ def main():
         print(f"Non-Key Latency: {avg_nk_time:.2f} ms | Non-Key VRAM: {avg_nk_mem:.2f} MB")
         if avg_nk_time > 0:
             print(f"Speedup (Key/Non-Key): {avg_k_time / avg_nk_time:.2f}x")
+    print("="*70)
+
+    # Diagnostics Summary
+    print("\n" + "="*70)
+    print("DIAGNOSTICS SUMMARY")
+    print("="*70)
+    print(f"  Key Path:  Avg IoU: {np.mean(key_ious):.4f} | Avg Conf: {np.mean(key_confs):.4f}")
+    print(f"  NK Path:   Avg IoU: {np.mean(nk_ious):.4f} | Avg Conf: {np.mean(nk_confs):.4f}")
+    
+    def get_sep(tp, fp):
+        if not tp or not fp: return 0.0
+        return np.mean(tp) - np.mean(fp)
+
+    print(f"\nTP/FP Score Separation (mean_tp - mean_fp):")
+    print(f"  Key Path:  {get_sep(key_tp_scores, key_fp_scores):.4f}")
+    print(f"  NK Path:   {get_sep(nk_tp_scores, nk_fp_scores):.4f}")
+    
+    print(f"\nDetailed Loss Analysis (Raw Criterion Values):")
+    if loss_stats['key']['class']:
+        print(f"  Key Loss:  Class: {np.mean(loss_stats['key']['class']):.4f} | Box: {np.mean(loss_stats['key']['box']):.4f}")
+    if loss_stats['nk']['class']:
+        print(f"  NK Loss:   Class: {np.mean(loss_stats['nk']['class']):.4f} | Box: {np.mean(loss_stats['nk']['box']):.4f}")
     print("="*70)
 
 if __name__ == '__main__':
