@@ -145,10 +145,11 @@ class Phase1Trainer:
             self.same_frame = False
 
         print(f"\nTraining Strategy: {self.training_strategy}")
-        if self.training_strategy == 'kd':
+        if self.training_strategy in ['kd', 'joint']:
                self.lambda_kd = getattr(self.cfg, 'lambda_kd', 150.0)
-               print(f"  - Feature KD weight (lambda_kd): {self.lambda_kd}")
-               print(f"  - Score KD weight (lambda_score): {self.lambda_score}")
+               if self.training_strategy == 'kd' or self.lambda_kd > 0 or self.lambda_score > 0:
+                   print(f"  - Feature KD weight (lambda_kd): {self.lambda_kd}")
+                   print(f"  - Score KD weight (lambda_score): {self.lambda_score}")
 
         if self.same_frame:
             print("--same_frame is active.")
@@ -216,11 +217,13 @@ class Phase1Trainer:
             loss = None
             loss_key_value = 0.0
             loss_non_key_value = 0.0
+            loss_kd_feat = 0.0
+            loss_kd_score = 0.0
 
             # 1. KEY FRAME PATH (The Teacher)
             if self.training_strategy == 'joint':
                 outputs_key = self.model.forward_key_frame(img_key, target_key)
-                if self.reuse_match_indices:
+                if self.reuse_match_indices or self.lambda_score > 0:
                     loss_dict_key, key_indices = self.criterion(
                         outputs_key, target_key, return_indices=True
                     )
@@ -251,7 +254,8 @@ class Phase1Trainer:
                             )
 
             # 2. NON-KEY FRAME PATH (The Student)
-            if self.training_strategy in ['kd', 'kd_only']:
+            use_kd = self.training_strategy in ['kd', 'kd_only'] or (self.training_strategy == 'joint' and (self.lambda_kd > 0 or self.lambda_score > 0))
+            if use_kd:
 
                 with torch.no_grad():
                     teacher_backbone_feats = self.model.backbone(img_non_key)
@@ -263,9 +267,9 @@ class Phase1Trainer:
                 )
 
                 # --- Feature KD Logic ---
-                loss_kd_feat = 0.0
-                for s_feat, t_feat in zip(student_fused, teacher_ccff):
-                    loss_kd_feat += F.mse_loss(F.normalize(s_feat, dim=1), F.normalize(t_feat, dim=1))
+                if self.lambda_kd > 0:
+                    for s_feat, t_feat in zip(student_fused, teacher_ccff):
+                        loss_kd_feat += F.mse_loss(F.normalize(s_feat, dim=1), F.normalize(t_feat, dim=1))
 
                 # --- Score KD Logic ---
                 criterion_kwargs = {}
@@ -282,25 +286,25 @@ class Phase1Trainer:
                 )
                 loss_hungarian = sum(loss_dict_non_key.values())
 
-                loss_kd_score = 0.0
-                batch_size = outputs_non_key['pred_logits'].shape[0]
-                student_probs = outputs_non_key['pred_logits'].sigmoid()
-                with torch.no_grad():
-                    teacher_probs = outputs_key['pred_logits'].sigmoid()
+                if self.lambda_score > 0:
+                    batch_size = outputs_non_key['pred_logits'].shape[0]
+                    student_probs = outputs_non_key['pred_logits'].sigmoid()
+                    with torch.no_grad():
+                        teacher_probs = outputs_key['pred_logits'].sigmoid()
 
-                num_matched_common = 0
-                for b in range(batch_size):
-                    k_src, k_tgt = key_indices[b]
-                    nk_src, nk_tgt = non_key_indices[b]
-                    k_map = {t.item(): s for s, t in zip(k_src, k_tgt)}
-                    nk_map = {t.item(): s for s, t in zip(nk_src, nk_tgt)}
-                    common_gts = set(k_map.keys()) & set(nk_map.keys())
-                    for g in common_gts:
-                        s_idx = nk_map[g]; t_idx = k_map[g]
-                        loss_kd_score += F.mse_loss(student_probs[b, s_idx], teacher_probs[b, t_idx].detach())
-                        num_matched_common += 1
-                if num_matched_common > 0:
-                    loss_kd_score /= num_matched_common
+                    num_matched_common = 0
+                    for b in range(batch_size):
+                        k_src, k_tgt = key_indices[b]
+                        nk_src, nk_tgt = non_key_indices[b]
+                        k_map = {t.item(): s for s, t in zip(k_src, k_tgt)}
+                        nk_map = {t.item(): s for s, t in zip(nk_src, nk_tgt)}
+                        common_gts = set(k_map.keys()) & set(nk_map.keys())
+                        for g in common_gts:
+                            s_idx = nk_map[g]; t_idx = k_map[g]
+                            loss_kd_score += F.mse_loss(student_probs[b, s_idx], teacher_probs[b, t_idx].detach())
+                            num_matched_common += 1
+                    if num_matched_common > 0:
+                        loss_kd_score /= num_matched_common
 
                 # Assign to non-key loss
                 if self.training_strategy == 'kd_only':
@@ -308,11 +312,12 @@ class Phase1Trainer:
                 else:
                     loss_non_key = loss_hungarian + self.lambda_kd * loss_kd_feat + self.lambda_score * loss_kd_score
 
-                total_feat_mse += loss_kd_feat.item()
+                total_feat_mse += loss_kd_feat.item() if isinstance(loss_kd_feat, torch.Tensor) else loss_kd_feat
                 total_score_mse += loss_kd_score.item() if isinstance(loss_kd_score, torch.Tensor) else loss_kd_score
 
             else:
                 # Standard Hungarian loss (decoder_only, freeze_key, and joint)
+                # Note: 'joint' hits this only if lambda_kd=0 and lambda_score=0
                 outputs_non_key = self.model.forward_non_key_frame(
                     img_non_key, target_non_key
                 )
@@ -354,16 +359,22 @@ class Phase1Trainer:
 
             # Logging
             if batch_idx % self.print_freq == 0:
+                f_mse = loss_kd_feat.item() if isinstance(loss_kd_feat, torch.Tensor) else loss_kd_feat
+                s_mse = loss_kd_score.item() if isinstance(loss_kd_score, torch.Tensor) else loss_kd_score
+                
                 if self.training_strategy == 'kd_only':
                     print(f"Batch [{batch_idx}/{len(self.dataloader)}] "
-                          f"Loss: {loss.item():.4f} (Feat MSE: {loss_kd_feat.item():.6f}, Score MSE: {loss_kd_score:.6f})")
+                          f"Loss: {loss.item():.4f} (Feat MSE: {f_mse:.6f}, Score MSE: {s_mse:.6f})")
                 elif self.training_strategy == 'kd':
                     print(f"Batch [{batch_idx}/{len(self.dataloader)}] "
-                          f"Loss: {loss.item():.4f} (Hungarian: {loss_hungarian.item():.4f}, Feat MSE: {loss_kd_feat.item():.6f}, Score MSE: {loss_kd_score:.6f})")
+                          f"Loss: {loss.item():.4f} (Hungarian: {loss_hungarian.item():.4f}, Feat MSE: {f_mse:.6f}, Score MSE: {s_mse:.6f})")
                 elif self.training_strategy == 'joint':
+                    kd_info = ""
+                    if self.lambda_kd > 0 or self.lambda_score > 0:
+                        kd_info = f" (Feat MSE: {f_mse:.6f}, Score MSE: {s_mse:.6f})"
                     print(f"Epoch [{epoch+1}] Batch [{batch_idx}/{len(self.dataloader)}] "
                           f"Loss: {loss.item():.4f} "
-                          f"(Key: {loss_key_value:.4f}, Non-Key: {loss_non_key_value:.4f})")
+                          f"(Key: {loss_key_value:.4f}, Non-Key: {loss_non_key_value:.4f}){kd_info}")
                 else:
                     print(f"Epoch [{epoch+1}] Batch [{batch_idx}/{len(self.dataloader)}] "
                           f"Loss: {loss.item():.4f} (Non-Key only)")
@@ -512,7 +523,12 @@ class Phase1Trainer:
         map50 = metrics.get('non_key_mAP@50', 0.0)
         
         # Filename (e.g., checkpoint_epoch_10_050.pth)
-        checkpoint_path = self.output_dir / f'{epoch:02d}_{int(map5095 * 1000):03d}_{int(map50 * 1000):03d}.pth'
+        if self.training_strategy == 'joint':
+            k_map5095 = metrics.get('key_mAP', 0.0)
+            k_map50 = metrics.get('key_mAP@50', 0.0)
+            checkpoint_path = self.output_dir / f'{epoch:02d}_{int(map5095 * 1000):03d}_{int(map50 * 1000):03d}_{int(k_map5095 * 1000):03d}_{int(k_map50 * 1000):03d}.pth'
+        else:
+            checkpoint_path = self.output_dir / f'{epoch:02d}_{int(map5095 * 1000):03d}_{int(map50 * 1000):03d}.pth'
         
         torch.save(checkpoint, checkpoint_path)
         print(f"Saved checkpoint to {checkpoint_path}")

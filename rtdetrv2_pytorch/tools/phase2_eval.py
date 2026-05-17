@@ -477,7 +477,6 @@ def evaluate_apg_stream(
                 eval_img_ids_nk.add(int(t['image_id'].item()))
 
     # --- SCORE TUNING & COMBINATION ---
-    key_scale = args.key_score
     nonkey_scale = args.nonkey_score
     combined_img_ids = eval_img_ids_key | eval_img_ids_nk
 
@@ -485,27 +484,23 @@ def evaluate_apg_stream(
         print("\nTuning confidence scores...")
         grid = [float(x.strip()) for x in args.score_grid.split(',') if x.strip()]
         best = None
-        for ks in grid:
-            for ns in grid:
-                scaled_key = scale_results(res_key, ks)
-                scaled_nk = scale_results(res_nk, ns)
-                filtered_nk = [det for det in scaled_nk if det['image_id'] not in eval_img_ids_key]
-                
-                m_ap, m_ap50, _ = evaluate_map(coco_gt, scaled_key + filtered_nk, combined_img_ids)
-                score = (m_ap, m_ap50)
-                if best is None or score > best['score']:
-                    best = {'ks': ks, 'ns': ns, 'score': score}
-        key_scale = best['ks']
+        for ns in grid:
+            scaled_nk = scale_results(res_nk, ns)
+            filtered_nk = [det for det in scaled_nk if det['image_id'] not in eval_img_ids_key]
+            
+            m_ap, m_ap50, _ = evaluate_map(coco_gt, res_key + filtered_nk, combined_img_ids)
+            score = (m_ap, m_ap50)
+            if best is None or score > best['score']:
+                best = {'ns': ns, 'score': score}
         nonkey_scale = best['ns']
-        print(f"Best scales: key={key_scale:.3f}, non-key={nonkey_scale:.3f}")
+        print(f"Best non-key scale: {nonkey_scale:.3f}")
 
-    scaled_res_key = scale_results(res_key, key_scale)
     scaled_res_nk = scale_results(res_nk, nonkey_scale)
     final_filtered_nk = [det for det in scaled_res_nk if det['image_id'] not in eval_img_ids_key]
     
-    map_k, map50_k, _ = evaluate_map(coco_gt, scaled_res_key, eval_img_ids_key)
+    map_k, map50_k, _ = evaluate_map(coco_gt, res_key, eval_img_ids_key)
     map_nk, map50_nk, _ = evaluate_map(coco_gt, scaled_res_nk, eval_img_ids_nk)
-    c_map, c_map50, c_map75 = evaluate_map(coco_gt, scaled_res_key + final_filtered_nk, combined_img_ids)
+    c_map, c_map50, c_map75 = evaluate_map(coco_gt, res_key + final_filtered_nk, combined_img_ids)
 
     key_ratio = key_decisions / max(1, total_frames)
 
@@ -523,7 +518,7 @@ def evaluate_apg_stream(
         'forced_key_ratio': forced_key_decisions / max(1, total_frames),
         'avg_interval': 1.0 / key_ratio if key_ratio > 0 else float('inf'),
         'total_frames': total_frames,
-        'key_score': key_scale, 'nonkey_score': nonkey_scale,
+        'nonkey_score': nonkey_scale,
         'avg_key_loss': total_key_loss / max(1, num_key_evals),
         'avg_nk_loss': total_nk_loss / max(1, num_nk_evals),
         'avg_key_iou': _mean_or_zero(diag_stats['key']['ious']),
@@ -546,10 +541,9 @@ def main():
     parser.add_argument('--threshold', type=float, default=0.5, help='APG probability threshold')
     parser.add_argument('--nk_per_key', '-n', type=int, default=10, 
                         help='Hard max number of non-key frames before forcing a key frame.')
-    parser.add_argument('--key_score', '-ks', type=float, default=1.0)
     parser.add_argument('--nonkey_score', '-ns', type=float, default=1.0)
     parser.add_argument('--tune_score', '-ts', action='store_true')
-    parser.add_argument('--score_grid', type=str, default='0.8,0.9,1.0,1.1,1.2')
+    parser.add_argument('--score_grid', type=str, default='1.0,1.02,1.04,1.06,1.08,1.10,1.12,1.14,1.16,1.18,1.20')
     parser.add_argument('--diag_score_thr', type=float, default=-1.0, help='Score threshold for IoU/conf and TP/FP diagnostics. Use <0 for no filtering (default).')
     parser.add_argument('--diag_iou_thr', type=float, default=0.5, help='IoU threshold for TP/FP assignment in diagnostics.')
     args = parser.parse_args()
@@ -571,7 +565,7 @@ def main():
     print("\n" + "="*70)
     print(f"APG STREAM EVALUATION SUMMARY (Threshold: {args.threshold} | Max NK: {args.nk_per_key})")
     print("="*70)
-    print(f"Score scales -> key: {stats['key_score']:.3f}, non-key: {stats['nonkey_score']:.3f}")
+    print(f"Score scale -> non-key: {stats['nonkey_score']:.3f}")
     print(f"Key Only    mAP: {stats['key_mAP']:.4f} | mAP50: {stats['key_mAP50']:.4f} | Loss: {stats['avg_key_loss']:.4f}")
     print(f"Non-Key Only mAP: {stats['nk_mAP']:.4f} | mAP50: {stats['nk_mAP50']:.4f} | Loss: {stats['avg_nk_loss']:.4f}")
     print(f"Combined     mAP: {stats['combined_mAP']:.4f} | mAP50: {stats['combined_mAP50']:.4f}")

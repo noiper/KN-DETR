@@ -11,6 +11,7 @@ import argparse
 import contextlib
 import io
 import torch
+import numpy as np
 from tqdm import tqdm
 
 # Ensure python path is correct when run from terminal
@@ -79,9 +80,9 @@ def parse_scale_grid(grid_text):
     return values
 
 def evaluate_map(coco_gt, results, title, img_ids=None):
-    """Runs pycocotools evaluation and returns (mAP, mAP50)."""
+    """Runs pycocotools evaluation and returns all 12 COCO stats."""
     if not results and not img_ids:
-        return 0.0, 0.0
+        return np.zeros(12)
         
     if not results:
         coco_dt = coco_gt.loadRes([])
@@ -103,9 +104,10 @@ def evaluate_map(coco_gt, results, title, img_ids=None):
     # COCOeval fills `stats` during summarize(); silence the default table output.
     with contextlib.redirect_stdout(io.StringIO()):
         evaluator.summarize()
-    if len(evaluator.stats) < 2:
-        return 0.0, 0.0
-    return evaluator.stats[0], evaluator.stats[1]
+    
+    if len(evaluator.stats) < 12:
+        return np.zeros(12)
+    return evaluator.stats
 
 def extract_video_id(file_name):
     """Extract video ID from filename (matches ViratTemporalDataset logic)"""
@@ -133,13 +135,11 @@ def main():
                         help='Stride between Key sequences. Overrides YAML config for clean usage.')
     parser.add_argument('--baseline', action='store_true',
                         help='Baseline: reuse key-frame detections directly for non-key frames')
-    parser.add_argument('--key_score', '-ks', type=float, default=1.0,
-                        help='Multiply key-path confidence scores by this factor before evaluation')
     parser.add_argument('--nonkey_score', '-ns', type=float, default=1.0,
                         help='Multiply non-key-path confidence scores by this factor before evaluation')
     parser.add_argument('--tune_score', '-ts', action='store_true',
-                        help='Grid search key/non-key score scales for best combined mAP')
-    parser.add_argument('--score_grid', type=str, default='0.8,0.9,1.0,1.1,1.2',
+                        help='Grid search non-key score scales for best combined mAP')
+    parser.add_argument('--score_grid', type=str, default='1.0,1.02,1.04,1.06,1.08,1.10,1.12,1.14,1.16,1.18,1.20',
                         help='Comma-separated scale grid for --tune_score')
     args = parser.parse_args()
     
@@ -152,9 +152,9 @@ def main():
     # --- HARDCODE BATCH SIZE TO 1 FOR REAL-TIME SIMULATION ---
     if 'val_dataloader' in cfg.yaml_cfg:
         print("Forcing validation batch_size=1 and drop_last=False for accurate real-time metrics.")
-        if 'batch_size' in cfg.yaml_cfg['val_dataloader']:
+        if 'batch_size' in cfg.yaml_cfg['batch_size']:
             cfg.yaml_cfg['val_dataloader']['batch_size'] = 1
-        if 'drop_last' in cfg.yaml_cfg['val_dataloader']:
+        if 'drop_last' in cfg.yaml_cfg['drop_last']:
             cfg.yaml_cfg['val_dataloader']['drop_last'] = False
 
         if 'dataset' in cfg.yaml_cfg['val_dataloader']:
@@ -366,55 +366,52 @@ def main():
     avg_k_loss = (metrics['k_loss'] / metrics['k_frames']) if metrics['k_frames'] > 0 else 0
     avg_nk_loss = (metrics['nk_loss'] / metrics['nk_frames']) if metrics['nk_frames'] > 0 else 0
 
-    key_scale = args.key_score
     nonkey_scale = args.nonkey_score
     combined_img_ids = eval_img_ids_key | eval_img_ids_nk
 
     if args.tune_score:
         grid = parse_scale_grid(args.score_grid)
         best = None
-        for ks in grid:
-            for ns in grid:
-                scaled_key = scale_results(res_key, ks)
-                scaled_nk = scale_results(res_nk, ns)
-                
-                # Filter out overlapping image IDs from non-key results
-                filtered_nk = [det for det in scaled_nk if det['image_id'] not in eval_img_ids_key]
-                
-                combined_map_tmp, combined_map50_tmp = evaluate_map(
-                    coco_gt, scaled_key + filtered_nk, "COMBINED OVERALL AVERAGE", combined_img_ids
-                )
-                score = (combined_map50_tmp, combined_map_tmp)
-                if best is None or score > best['score']:
-                    best = {
-                        'key_scale': ks,
-                        'nonkey_scale': ns,
-                        'combined_map': combined_map_tmp,
-                        'combined_map50': combined_map50_tmp,
-                        'score': score,
-                    }
-        key_scale = best['key_scale']
+        for ns in grid:
+            scaled_nk = scale_results(res_nk, ns)
+            
+            # Filter out overlapping image IDs from non-key results
+            filtered_nk = [det for det in scaled_nk if det['image_id'] not in eval_img_ids_key]
+            
+            stats_tmp = evaluate_map(
+                coco_gt, res_key + filtered_nk, "COMBINED OVERALL AVERAGE", combined_img_ids
+            )
+            score = (stats_tmp[1], stats_tmp[0]) # (mAP50, mAP)
+            if best is None or score > best['score']:
+                best = {
+                    'nonkey_scale': ns,
+                    'score': score,
+                }
         nonkey_scale = best['nonkey_scale']
-        print(f"Tuned score scales: key={key_scale:.3f}, non-key={nonkey_scale:.3f}")
+        print(f"Tuned score scale: non-key={nonkey_scale:.3f}")
 
-    scaled_res_key = scale_results(res_key, key_scale)
     scaled_res_nk = scale_results(res_nk, nonkey_scale)
     
     # Filter out overlapping image IDs from non-key results for final combined metric
     final_filtered_nk = [det for det in scaled_res_nk if det['image_id'] not in eval_img_ids_key]
-    scaled_combined = scaled_res_key + final_filtered_nk
+    scaled_combined = res_key + final_filtered_nk
 
-    map_k, map50_k = evaluate_map(coco_gt, scaled_res_key, "HEAVY KEY MODEL ONLY", eval_img_ids_key)
-    map_nk, map50_nk = evaluate_map(coco_gt, scaled_res_nk, "LIGHTWEIGHT NON-KEY MODEL ONLY", eval_img_ids_nk)
-    combined_map, combined_map50 = evaluate_map(coco_gt, scaled_combined, "COMBINED OVERALL AVERAGE", combined_img_ids)
+    stats_k = evaluate_map(coco_gt, res_key, "HEAVY KEY MODEL ONLY", eval_img_ids_key)
+    stats_nk = evaluate_map(coco_gt, scaled_res_nk, "LIGHTWEIGHT NON-KEY MODEL ONLY", eval_img_ids_nk)
+    stats_combined = evaluate_map(coco_gt, scaled_combined, "COMBINED OVERALL AVERAGE", combined_img_ids)
 
     print("\n" + "="*70)
     print(f"FINAL SUMMARY (Level {args.nk_per_key} | Stride {cycle_len})")
     print("="*70)
-    print(f"Score scales -> key: {key_scale:.3f}, non-key: {nonkey_scale:.3f}")
-    print(f"Key      mAP: {map_k:.4f} | mAP50: {map50_k:.4f} | Loss: {avg_k_loss:.4f}")
-    print(f"Non-Key  mAP: {map_nk:.4f} | mAP50: {map50_nk:.4f} | Loss: {avg_nk_loss:.4f}")
-    print(f"Combined mAP: {combined_map:.4f} | mAP50: {combined_map50:.4f}")
+    print(f"Score scale -> non-key: {nonkey_scale:.3f}")
+
+    def print_coco_stats(label, stats, loss=None):
+        print(f"{label: <8} mAP: {stats[0]:.4f} | mAP50: {stats[1]:.4f} | mAP75: {stats[2]:.4f}")
+        print(f"{' ': <8} mAP_s: {stats[3]:.4f} | mAP_m: {stats[4]:.4f} | mAP_l: {stats[5]:.4f}" + (f" | Loss: {loss:.4f}" if loss is not None else ""))
+
+    print_coco_stats("Key", stats_k, avg_k_loss)
+    print_coco_stats("Non-Key", stats_nk, avg_nk_loss)
+    print_coco_stats("Combined", stats_combined)
     print("-"*70)
     print(f"Key Latency: {avg_k_time:.2f} ms | Key VRAM: {avg_k_mem:.2f} MB")
     if not args.baseline:
